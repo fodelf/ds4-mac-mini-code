@@ -19,6 +19,38 @@ Append-only chronological record of significant DS4 work — design docs, atomic
 - **2026-05-24** — #48 诊断日志注入 patch landed (DS4_DIAG=1 gated; build green). vmstat snapshots + per-CB commit prints around prefill setup (alloc/steering/upload/warmup/prefill_layer_major/split-loop) so the next smoke pinpoints exactly which step OOMs. `smoke-low-mem.sh` now exports `DS4_DIAG=1` and post-runs greps for the new traces.
 - **2026-05-24** — #47 CB-split env-var patch landed (code-only, validation gated). Two opt-in env vars: `DS4_METAL_PREFILL_SPLIT=1` (forces per-layer CB during short-prompt prefill) + `DS4_METAL_DECODE_SPLIT_EVERY=1` (flushes after every N decode layers). Both default-off; no behavior change without opt-in. `smoke-low-mem.sh` updated to set both. Build + smoke pending explicit user authorization.
 
+## 2026-05-24 — #54 Path A 设计 memo (disk-offload routed experts)
+- **触发：** K=16/24/48 三档 smoke 完成后 (#53)，K=48 输出 `: 1+1=0? 1+1=0?`——语法对、算术错。K-shrink 路线确认有质量天花板：DS V4 Flash 训练分布是 top-6 from **256**，mask 掉 81% (K=48) 导致路由严重 OOD。继续升 K (K=64/96) 收益递减，**结构性问题需要换方向**。
+- **决策（用户拍板）：** 走 Path A —— 不 mask，全 256 expert 都用，把内存压力从"常驻全模型"挪到"按需 page-in / file-backed cache"。
+- **现状调查（survey）：**
+  - routed expert 走和其他张量一样的 mmap 路径；无 lazy/offload 基础设施 (`ds4.c:1300, 2227-2229, 2840-2842`)。
+  - Metal `newBufferWithBytesNoCopy` 一次把整 GGUF 当 view 组注册 (`ds4_metal.m:540`)；`wrap_model_range` 按 offset 找 view+inner_offset (`ds4_metal.m:4795`)。
+  - MoE kernel 硬编码绑全张量：`metal/moe.metal:778` 是 `i02 = ids[idx]; src0_cur = src0s + i02 * nb02`。**当前没有"只绑活跃 expert"路径**——要么改 kernel，要么 host 侧重打包 + 重写 ids。
+  - 每 expert 6.75 MiB (gate 2.06 + up 2.06 + down 2.625)。每层 256 expert = 1.69 GiB；43 层 = 72.6 GiB。
+  - decode 单层只触 6 expert = 40 MiB；prefill 单层 union 可触满 1.69 GiB。两个负载完全不同。
+- **三档 Path A：**
+  - **A1 裸版**：用原 81 GB GGUF + 现有 view-shrink + per-layer CB split。零代码改动。Quality = 原始；OOM 风险低（view-shrink 已证 wireable peak ≤7 GiB）；速度风险高（prefill 触 73 GB I/O，~18 min @ NVMe 3 GB/s）。
+  - **A2 decode-only offload**：A1 基础上，decode 时按 6 个活跃 expert 重打包到 scratch buffer + 重写 ids 成 0..5。**不动 kernel**，仅 host 侧改 `ds4_metal.m:13439 routed_moe_one_tensor`。中等工程量。解决 decode 速度。
+  - **A3 full offload**：A2 + prefill 也按 expert 分组重打包。重，要改 kernel signature 或加新 entrypoint。Prefill 速度不一定显著改善（数据量没变）。
+- **执行策略：先 A1 做可行性验证，再决定要不要 A2。** 理由：
+  1. A1 零代码、立刻能验。如果跑出 `1+1=2`，证明"放弃 K-shrink + 用全 expert"质量假设成立。
+  2. A1 失败概率不大（IOGPU OOM 已解决；唯一风险是速度）。
+  3. A1 提供 ground truth 给 A2 比对。
+- **A1 判定标准：**
+  - **质量回归**：能否对 `1+1=` 给出包含 `2` 的连贯输出。如果是，质量假设成立。
+  - **OOM 风险**：是否在 prefill 中段 IOGPU OOM。如果 K=48 同 view-cap 下不 OOM，A1 也不应 OOM。
+  - **速度可承受度**：prefill < 30 min 且 decode > 0.05 t/s 算 PoC 通过。
+- **A1 run 命令（用户手动跑）：**
+  ```sh
+  DS4_MODEL=./gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf \
+  ./smoke-watch.sh 1024 8 "1+1="
+  ```
+- **磁盘策略：** K=16/K=24 暂不删（A1 跑挂可立即回 K=48 做 baseline）；A1 通过后再 `rm gguf/ds4flash-k{16,24}.gguf` 释放 28 GB。
+- **Status:** 设计 memo 落地；smoke pending 用户手动执行（已警告 prefill 可能 5-25 min，不要中断）。
+- **#54-patch1 (2026-05-24 22:55)：** A1 首次 smoke 在 `ds4: Metal model needs more mapped views than expected` 停住——`ds4_metal.m:218` 静态上限 `DS4_METAL_MAX_MODEL_VIEWS=16`，81 GB / 3.5 GiB cap 需要 22 view 超过 16。上层 `ds4_gpu_map_model_views` 返回 0 后 caller 没干净退出（这是次要 bug，不修）。**Fix：** 上限 16 → 32（覆盖 32 × 3.5 = 112 GiB；32 × 默认 8.88 GiB = 284 GiB 也够）。`make` 通过 warning 一条无害（未用函数）。
+- **#54-patch1 验证：** prefill 进展到 layer ~24（cb_total=26）后 `kIOGPUCommandBufferCallbackErrorOutOfMemory`。drv=99 GiB（账面，不是实际 wired）。根因诊断：A1 单层 expert 数据 1.7 GiB（vs K=48 case 96 MB/层）经常跨 view，单 CB wireable peak 7-10 GiB，16 GiB 系统 OS 占 ~3 GiB 后余 13 GiB 不够。
+- **#54-patch2 (2026-05-24 22:59)：** view cap 进一步缩水到 2 GiB（每层 1.7 GiB > view 2 GiB → 每层都跨 view，但 peak 2×2=4 GiB vs 之前 7 GiB）。bump `MAX_MODEL_VIEWS` 32 → 64（覆盖 81/2=41 view + headroom）。view cap 通过 env var `DS4_METAL_MODEL_MAX_VIEW_BYTES_OVERRIDE=$((2*1024*1024*1024))` 在脚本侧传入，不改默认值。`make` 通过 warning 同前。判定：(i) 通过 → A1 PoC 成立；(i) 再 OOM → view-shrink 触顶，必须做 A3 pre-pack offload。
+
 ## 2026-05-24 — #53 第一 token 跑通 + smoke-watch.sh live monitor 落地
 - **里程碑：** 16 GiB Mac Mini M4 在 K=16 + 3.5 GiB view-cap 配置下，**首个 token 成功 emit**。
 - **证据（`/tmp/ds4-smoke-20260524-213935.{stdout,stderr}.log`）：**

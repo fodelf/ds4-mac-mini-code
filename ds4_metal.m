@@ -215,7 +215,7 @@ static void ds4_gpu_print_device_summary(void) {
     }
 }
 
-#define DS4_METAL_MAX_MODEL_VIEWS 16
+#define DS4_METAL_MAX_MODEL_VIEWS 64  /* 64 × 1.25 GiB cap covers 80 GiB; 64 × 2 GiB covers 128 GiB (needed for full 81 GB GGUF with sub-3.5 GiB view-shrink to keep per-CB wireable peak bounded). */
 #define DS4_METAL_MODEL_MAX_TENSOR_BYTES 704643072ull
 
 typedef struct {
