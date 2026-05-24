@@ -11,8 +11,6 @@
 /gguf/
 *.o
 *.dSYM/
-__pycache__/
-*.pyc
 /misc/
 .*.swp
 .DS_Store

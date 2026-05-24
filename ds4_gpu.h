@@ -30,9 +30,6 @@ int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *dat
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
-int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
-                                   const ds4_gpu_tensor *src, uint64_t src_offset,
-                                   uint64_t count);
 
 int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_commands(void);
@@ -47,6 +44,19 @@ int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint6
 int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes);
 void ds4_gpu_set_quality(bool quality);
 void ds4_gpu_print_memory_report(const char *label);
+
+/* Upload the per-layer routed-MoE expert mask. mask is n_layers * n_expert
+ * bytes, 1 byte per (layer, expert), 1=keep, 0=disable. Pass mask=NULL to
+ * clear. Returns 1 on success. */
+int ds4_gpu_set_expert_mask(const uint8_t *mask, uint32_t n_layers, uint32_t n_expert);
+
+/* Upload the keep_map LUT for shrunken GGUFs. lut is n_layers * n_expert
+ * int32 entries: lut[il*n_expert + orig_id] = compact tensor slot, or -1
+ * if the original expert was dropped. The Metal route-translate kernel
+ * uses this to convert router selections (original-id space) into compact
+ * slots before the MoE matvecs index the shrunken expert tensors. Pass
+ * lut=NULL to clear. Returns 1 on success. */
+int ds4_gpu_set_expert_keep_lut(const int32_t *lut, uint32_t n_layers, uint32_t n_expert);
 
 /* =========================================================================
  * Embeddings and Indexer Helpers.
@@ -259,6 +269,39 @@ int ds4_gpu_dsv4_indexer_qat_tensor(
         uint32_t          n_rows,
         uint32_t          head_dim);
 
+/* Commit F32 scratch rows into the F16 compressed-KV cache.  The producer
+ * pipeline (pool / rms_norm / rope_tail / ratio4_shift / FP8 or QAT) runs in
+ * a small F32 scratch tensor.  When the pipeline finishes, the caller invokes
+ * this wrapper to copy that scratch slab into the per-layer F16 cache row(s)
+ * with a half(v) cast — the only semantic precision change introduced by the
+ * F16-storage flip. */
+int ds4_gpu_dsv4_f32_to_f16_store_rows_tensor(
+        ds4_gpu_tensor       *dst_f16,
+        uint64_t                dst_row_byte_offset,
+        const ds4_gpu_tensor *src_f32,
+        uint64_t                src_row_byte_offset,
+        uint32_t                n_rows,
+        uint32_t                head_dim);
+
+/* Lever A (#34) helpers. The attn_comp_kv cache now stores 608-byte
+ * FP8+scale+F16-RoPE rows instead of head-dim*2 F16 rows. The store wrapper
+ * below replaces ds4_gpu_dsv4_f32_to_f16_store_rows_tensor + an in-scratch
+ * FP8 quantize pass on the compressor producer path: it fuses the per-block
+ * FP8 encode, the scale dump, and the F16 RoPE cast into one dispatch that
+ * writes the full 608-byte row layout.  The row-bytes helper exists so
+ * ds4.c snapshot accounting and the Metal FA pack-in stride math both agree
+ * on the byte count for a given (head_dim, n_rot). */
+uint64_t ds4_gpu_dsv4_fp8_attn_row_bytes(uint32_t head_dim, uint32_t n_rot);
+
+int ds4_gpu_dsv4_f32_to_fp8_store_rows_tensor(
+        ds4_gpu_tensor       *dst_fp8,
+        uint64_t                dst_row_byte_offset,
+        const ds4_gpu_tensor *src_f32,
+        uint64_t                src_row_byte_offset,
+        uint32_t                n_rows,
+        uint32_t                head_dim,
+        uint32_t                n_rot);
+
 int ds4_gpu_rope_tail_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_tok,
@@ -429,7 +472,6 @@ int ds4_gpu_attention_decode_heads_tensor(
         uint32_t                raw_cap,
         uint32_t                raw_start,
         const ds4_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
         uint32_t                n_comp,
         const ds4_gpu_tensor *comp_mask,
         uint32_t                use_mask,
@@ -472,7 +514,6 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
         const ds4_gpu_tensor *comp_mask,
         uint32_t                use_comp_mask,
         uint32_t                n_tokens,
@@ -494,7 +535,6 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
         const ds4_gpu_tensor *topk,
         uint32_t                n_tokens,
         uint32_t                pos0,
@@ -516,7 +556,6 @@ int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
         uint32_t                n_tokens,
         uint32_t                n_comp,
         uint32_t                window,
@@ -532,7 +571,6 @@ int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
         const ds4_gpu_tensor *comp_mask,
         uint32_t                n_tokens,
         uint32_t                n_comp,
@@ -607,6 +645,7 @@ int ds4_gpu_router_select_tensor(
         uint64_t                hash_offset,
         uint32_t                hash_rows,
         uint32_t                token,
+        uint32_t                layer,
         uint32_t                n_expert_groups,
         uint32_t                n_group_used,
         bool                    has_bias,
@@ -622,6 +661,7 @@ int ds4_gpu_router_select_batch_tensor(
         uint64_t                bias_offset,
         uint64_t                hash_offset,
         uint32_t                hash_rows,
+        uint32_t                layer,
         uint32_t                n_expert_groups,
         uint32_t                n_group_used,
         bool                    has_bias,
@@ -630,6 +670,14 @@ int ds4_gpu_router_select_batch_tensor(
         const ds4_gpu_tensor *tokens,
         uint32_t                n_tokens);
 
+/* n_expert_total: how many experts live in the on-disk routed tensor for
+ * this layer. 256 for an un-shrunken GGUF; less for layers that were
+ * shrunken via the ds4.expert_keep_map.
+ * layer: index used to look up the keep_map LUT row. When the LUT has been
+ * uploaded via ds4_gpu_set_expert_keep_lut(), the entrypoint runs an internal
+ * route-translate kernel that converts selected[] from original-id space to
+ * compact-slot space before the MoE matvec. When no LUT is set, selected[] is
+ * passed through unchanged. */
 int ds4_gpu_routed_moe_one_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,
@@ -653,6 +701,8 @@ int ds4_gpu_routed_moe_one_tensor(
         const ds4_gpu_tensor *selected,
         const ds4_gpu_tensor *weights,
         uint32_t                n_expert,
+        uint32_t                n_expert_total,
+        uint32_t                layer,
         float                   clamp,
         const ds4_gpu_tensor *x);
 
@@ -679,9 +729,10 @@ int ds4_gpu_routed_moe_batch_tensor(
         const ds4_gpu_tensor *selected,
         const ds4_gpu_tensor *weights,
         uint32_t                n_expert,
+        uint32_t                n_expert_total,
+        uint32_t                layer,
         float                   clamp,
         const ds4_gpu_tensor *x,
-        uint32_t                layer_index,
         uint32_t                n_tokens,
         bool                   *mid_is_f16);
 

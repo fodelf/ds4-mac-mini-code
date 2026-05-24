@@ -188,8 +188,7 @@ else
 	$(NVCC) $(NVCCFLAGS) -o $@ ds4_test.o ds4_kvstore.o rax.o $(CORE_OBJS) $(CUDA_LDLIBS)
 endif
 
-test: ds4_test ds4-eval
-	./ds4-eval --self-test-extractors
+test: ds4_test
 	./ds4_test
 
 clean:
