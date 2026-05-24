@@ -159,6 +159,20 @@ static id<MTLBuffer> g_moe_gate_scratch_buffer;
 static id<MTLBuffer> g_moe_down_scratch_buffer;
 static id<MTLBuffer> g_moe_id_map_buffer;
 static id<MTLBuffer> g_attn_out_group_ids_buffer;
+/*
+ * #55 A3 expert pre-pack scratch buffers.  Per-layer routed-expert tensor data
+ * (gate / up / down) is CPU-side memcpy'd from the GGUF mmap into these three
+ * resident MTLBuffers before each MoE dispatch; the matmul kernels then read
+ * from scratch instead of from a mmap-backed view buffer.  This bounds the
+ * per-CB wireable peak (1.728 GiB scratch vs. potentially 2x or 3x the view
+ * cap when a layer's tensors straddle multiple model views).  Layout matches
+ * the GGUF tensor exactly (256 slots, fixed stride) so kernels indexing by
+ * `ids[]` need no change.  Gated by DS4_METAL_EXPERT_OFFLOAD; allocated lazily
+ * on first MoE call from the actual expert-tensor dims.  See execution-log #55.
+ */
+static id<MTLBuffer> g_moe_scratch_gate;
+static id<MTLBuffer> g_moe_scratch_up;
+static id<MTLBuffer> g_moe_scratch_down;
 static const void *g_model_map_ptr;
 static uint64_t g_model_map_size;
 static uint64_t g_model_mapped_offset;
@@ -194,6 +208,9 @@ static NSUInteger g_moe_gate_scratch_bytes;
 static NSUInteger g_moe_down_scratch_bytes;
 static NSUInteger g_moe_id_map_bytes;
 static NSUInteger g_attn_out_group_ids_bytes;
+static NSUInteger g_moe_scratch_gate_bytes;
+static NSUInteger g_moe_scratch_up_bytes;
+static NSUInteger g_moe_scratch_down_bytes;
 static int g_initialized;
 static int g_quality_mode;
 
@@ -4436,6 +4453,12 @@ void ds4_gpu_cleanup(void) {
         g_moe_down_scratch_buffer = nil;
         g_moe_id_map_buffer = nil;
         g_attn_out_group_ids_buffer = nil;
+        g_moe_scratch_gate = nil;
+        g_moe_scratch_up = nil;
+        g_moe_scratch_down = nil;
+        g_moe_scratch_gate_bytes = 0;
+        g_moe_scratch_up_bytes = 0;
+        g_moe_scratch_down_bytes = 0;
         g_model_map_ptr = NULL;
         g_model_map_size = 0;
         g_model_mapped_offset = 0;
@@ -13428,6 +13451,115 @@ int ds4_gpu_router_select_batch_tensor(
     return 1;
 }
 
+/*
+ * #55 A3: env-gated CPU-side expert pre-pack.  Cached for the lifetime of the
+ * process so the env check + log fire exactly once.  Setting to anything other
+ * than "0" / "" enables the pre-pack path; unset (default) keeps the original
+ * mmap-view binding so existing diag traces stay reproducible.
+ */
+static int ds4_gpu_expert_offload_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("DS4_METAL_EXPERT_OFFLOAD");
+        cached = (v && v[0] && !(v[0] == '0' && v[1] == '\0')) ? 1 : 0;
+        if (cached) {
+            fprintf(stderr,
+                    "ds4: DS4_METAL_EXPERT_OFFLOAD=1: routed-expert tensors will be CPU-memcpy'd "
+                    "into resident scratch each layer; bounds per-CB wireable peak to scratch size "
+                    "(Path A3 — see notes/execution-log.md #55).\n");
+        }
+    }
+    return cached;
+}
+
+/*
+ * #55 A3: ensure the three routed-MoE scratch buffers are allocated at the
+ * full 256-slot tensor size and copy the active experts' bytes from the GGUF
+ * mmap into the corresponding slots.  Layout in scratch is identical to the
+ * on-disk tensor so the matmul kernels (which index by expert id × stride)
+ * need no source changes.
+ *
+ *   active_ids == NULL → copy all n_expert_total slots (used by prefill; long
+ *                       prompts route across nearly all 256 experts so the
+ *                       sync-readback to discover the exact active set isn't
+ *                       worth its CB-flush cost).
+ *   active_ids != NULL → copy only the listed ids (decode path: just 6 active
+ *                       expert slots per layer = 40 MiB instead of 1.7 GiB).
+ *                       The other slots retain stale data from a previous
+ *                       layer; kernel never reads them because selected[]
+ *                       holds only the active ids.
+ *
+ * Returns 0 if scratch allocation fails or model_map is NULL.  Uses
+ * Shared storage (Apple Silicon unified memory is coherent without
+ * didModifyRange); on Intel Macs the same call would need Managed +
+ * didModifyRange, but ds4's target is M-series only.
+ */
+static int ds4_gpu_load_layer_experts_to_scratch(
+        const void *model_map,
+        uint32_t    layer,
+        uint32_t    n_active,
+        const uint32_t *active_ids,
+        uint64_t    gate_offset,
+        uint64_t    up_offset,
+        uint64_t    down_offset,
+        uint64_t    gate_expert_bytes,
+        uint64_t    down_expert_bytes,
+        uint32_t    n_expert_total) {
+    if (!model_map || n_expert_total == 0) {
+        fprintf(stderr, "ds4: A3 expert pre-pack: model_map=%p n_expert_total=%u\n",
+                model_map, n_expert_total);
+        return 0;
+    }
+
+    const uint64_t gate_total_u64 = (uint64_t)n_expert_total * gate_expert_bytes;
+    const uint64_t down_total_u64 = (uint64_t)n_expert_total * down_expert_bytes;
+    if (gate_total_u64 > NSUIntegerMax || down_total_u64 > NSUIntegerMax) {
+        fprintf(stderr, "ds4: A3 expert pre-pack: tensor size overflow\n");
+        return 0;
+    }
+    const NSUInteger gate_total = (NSUInteger)gate_total_u64;
+    const NSUInteger down_total = (NSUInteger)down_total_u64;
+
+    if (!ds4_gpu_ensure_scratch_buffer(&g_moe_scratch_gate, &g_moe_scratch_gate_bytes,
+                                       gate_total, "ds4_moe_scratch_gate") ||
+        !ds4_gpu_ensure_scratch_buffer(&g_moe_scratch_up, &g_moe_scratch_up_bytes,
+                                       gate_total, "ds4_moe_scratch_up") ||
+        !ds4_gpu_ensure_scratch_buffer(&g_moe_scratch_down, &g_moe_scratch_down_bytes,
+                                       down_total, "ds4_moe_scratch_down")) {
+        return 0;
+    }
+
+    const uint8_t *map = (const uint8_t *)model_map;
+    uint8_t *gate_dst = (uint8_t *)g_moe_scratch_gate.contents;
+    uint8_t *up_dst   = (uint8_t *)g_moe_scratch_up.contents;
+    uint8_t *down_dst = (uint8_t *)g_moe_scratch_down.contents;
+    if (!gate_dst || !up_dst || !down_dst) {
+        fprintf(stderr, "ds4: A3 expert pre-pack: scratch contents pointer is null\n");
+        return 0;
+    }
+
+    if (active_ids == NULL) {
+        /* Prefill: copy all 256 slots in three contiguous memcpys. */
+        memcpy(gate_dst, map + gate_offset, (size_t)gate_total_u64);
+        memcpy(up_dst,   map + up_offset,   (size_t)gate_total_u64);
+        memcpy(down_dst, map + down_offset, (size_t)down_total_u64);
+    } else {
+        /* Decode: copy only the listed active expert slots. */
+        for (uint32_t i = 0; i < n_active; i++) {
+            const uint32_t id = active_ids[i];
+            if (id >= n_expert_total) continue;
+            const uint64_t gate_slot = (uint64_t)id * gate_expert_bytes;
+            const uint64_t down_slot = (uint64_t)id * down_expert_bytes;
+            memcpy(gate_dst + gate_slot, map + gate_offset + gate_slot, (size_t)gate_expert_bytes);
+            memcpy(up_dst   + gate_slot, map + up_offset   + gate_slot, (size_t)gate_expert_bytes);
+            memcpy(down_dst + down_slot, map + down_offset + down_slot, (size_t)down_expert_bytes);
+        }
+    }
+
+    (void)layer;  /* reserved for per-layer diag traces if needed later */
+    return 1;
+}
+
 int ds4_gpu_routed_moe_one_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,
@@ -13502,6 +13634,62 @@ int ds4_gpu_routed_moe_one_tensor(
         id<MTLBuffer> up_buf = ds4_gpu_wrap_model_range(model_map, model_size, up_offset, gate_tensor_bytes, &up_inner);
         id<MTLBuffer> down_buf = ds4_gpu_wrap_model_range(model_map, model_size, down_offset, down_tensor_bytes, &down_inner);
         if (!gate_buf || !up_buf || !down_buf) return 0;
+
+        /*
+         * #55 A3 decode pre-pack: read the active 6 expert ids from selected[]
+         * (the router output), then memcpy only those 6 expert slots from the
+         * GGUF mmap into the resident scratch buffers.  Replace the mmap-view
+         * binding (gate_buf/up_buf/down_buf) with scratch + offset 0.  Kernels
+         * see an identical 256-slot tensor layout because scratch is sized for
+         * the full tensor; inactive slots retain stale bytes but the matmul
+         * never reads them.
+         *
+         * To read selected[] on the CPU we must wait for the prior dispatches
+         * (router_finalize_one / route_translate) in the live batch CB to have
+         * committed and completed.  If we're inside a layer-major batch CB we
+         * end it, do the readback + memcpy, then begin a fresh batch CB so the
+         * rest of this function dispatches into a clean per-layer CB.  When
+         * not in batched mode (standalone CB), the upstream caller has already
+         * synchronized so we can read directly.
+         */
+        if (ds4_gpu_expert_offload_enabled()) {
+            const int was_batched = (g_batch_cb != nil);
+            if (was_batched) {
+                if (ds4_gpu_end_commands() == 0) return 0;
+            }
+            if (selectedbuf.storageMode != MTLStorageModeShared) {
+                fprintf(stderr,
+                        "ds4: A3 expert offload requires Shared-storage selected buffer (got mode %lu)\n",
+                        (unsigned long)selectedbuf.storageMode);
+                if (was_batched) (void)ds4_gpu_begin_commands();
+                return 0;
+            }
+            const int32_t *sel_cpu =
+                (const int32_t *)((const uint8_t *)selectedbuf.contents + (size_t)selected_off);
+            uint32_t active_ids[6];
+            for (uint32_t i = 0; i < n_expert; i++) {
+                int32_t raw = sel_cpu[i];
+                if (raw < 0) raw = 0;
+                active_ids[i] = (uint32_t)raw;
+            }
+            const int load_ok = ds4_gpu_load_layer_experts_to_scratch(
+                model_map, layer, n_expert, active_ids,
+                gate_offset, up_offset, down_offset,
+                gate_expert_bytes, down_expert_bytes, n_expert_total);
+            if (!load_ok) {
+                if (was_batched) (void)ds4_gpu_begin_commands();
+                return 0;
+            }
+            gate_buf = g_moe_scratch_gate;
+            up_buf = g_moe_scratch_up;
+            down_buf = g_moe_scratch_down;
+            gate_inner = 0;
+            up_inner = 0;
+            down_inner = 0;
+            if (was_batched) {
+                if (ds4_gpu_begin_commands() == 0) return 0;
+            }
+        }
 
         const uint32_t n_tokens = 1;
         const uint32_t pair_rows = n_tokens * n_expert;
@@ -13850,6 +14038,81 @@ int ds4_gpu_routed_moe_batch_tensor(
         id<MTLBuffer> up_buf = ds4_gpu_wrap_model_range(model_map, model_size, up_offset, gate_tensor_bytes, &up_inner);
         id<MTLBuffer> down_buf = ds4_gpu_wrap_model_range(model_map, model_size, down_offset, down_tensor_bytes, &down_inner);
         if (!gate_buf || !up_buf || !down_buf) return 0;
+
+        /*
+         * #55 A3 prefill pre-pack (selective).  v1 of A3 copied all 256 expert
+         * slots per layer unconditionally; for short prompts (n_tokens=15-20,
+         * up to ~120 unique active experts) that pessimized the on-disk I/O
+         * by touching half the routed-tensor pages that the kernel never
+         * reads, churning the OS file cache through a 16 GiB host RAM for an
+         * 81 GiB GGUF.  Measured 3× regression vs. mmap-view baseline.
+         *
+         * Fix: behave like the decode path — sync-readback selected[] (which
+         * holds n_tokens × n_expert picks, ≤ 256 unique by construction),
+         * dedupe into active_ids[], and memcpy only those slots.  For long
+         * prompts where routing hits all 256, this naturally degenerates to
+         * the full copy.  Sync cost (end_commands + begin_commands per layer)
+         * is ~10 ms × 43 ≈ 0.4 s on a 90 s baseline prefill — negligible.
+         */
+        if (ds4_gpu_expert_offload_enabled()) {
+            const int was_batched = (g_batch_cb != nil);
+            if (was_batched) {
+                if (ds4_gpu_end_commands() == 0) return 0;
+            }
+            if (selectedbuf.storageMode != MTLStorageModeShared) {
+                fprintf(stderr,
+                        "ds4: A3 expert offload requires Shared-storage selected buffer (got mode %lu)\n",
+                        (unsigned long)selectedbuf.storageMode);
+                if (was_batched) (void)ds4_gpu_begin_commands();
+                return 0;
+            }
+            /*
+             * Bitmap-based dedupe over n_tokens * n_expert picks.  Cap the
+             * bitmap at n_expert_total bits; DeepSeek V4 Flash uses 256 routed
+             * experts so 32 bytes is enough.  active_ids[] is sized to the
+             * worst case (every slot active) and lives on the stack only for
+             * n_expert_total ≤ 1024; larger models would need a heap path.
+             */
+            if (n_expert_total > 1024) {
+                fprintf(stderr,
+                        "ds4: A3 prefill pre-pack does not support n_expert_total=%u (max 1024)\n",
+                        n_expert_total);
+                if (was_batched) (void)ds4_gpu_begin_commands();
+                return 0;
+            }
+            uint8_t seen[(1024 + 7) / 8] = {0};
+            uint32_t active_ids[1024];
+            uint32_t n_active = 0;
+            const int32_t *sel_cpu =
+                (const int32_t *)((const uint8_t *)selectedbuf.contents + (size_t)selected_off);
+            const uint64_t total_picks = (uint64_t)n_tokens * (uint64_t)n_expert;
+            for (uint64_t i = 0; i < total_picks; i++) {
+                int32_t raw = sel_cpu[i];
+                if (raw < 0 || (uint32_t)raw >= n_expert_total) continue;
+                uint32_t id = (uint32_t)raw;
+                if (!(seen[id >> 3] & (uint8_t)(1u << (id & 7u)))) {
+                    seen[id >> 3] |= (uint8_t)(1u << (id & 7u));
+                    active_ids[n_active++] = id;
+                }
+            }
+            const int load_ok = ds4_gpu_load_layer_experts_to_scratch(
+                model_map, layer, n_active, active_ids,
+                gate_offset, up_offset, down_offset,
+                gate_expert_bytes, down_expert_bytes, n_expert_total);
+            if (!load_ok) {
+                if (was_batched) (void)ds4_gpu_begin_commands();
+                return 0;
+            }
+            gate_buf = g_moe_scratch_gate;
+            up_buf = g_moe_scratch_up;
+            down_buf = g_moe_scratch_down;
+            gate_inner = 0;
+            up_inner = 0;
+            down_inner = 0;
+            if (was_batched) {
+                if (ds4_gpu_begin_commands() == 0) return 0;
+            }
+        }
 
         const uint32_t pair_rows = n_tokens * n_expert;
         const uint64_t down_scratch_bytes = (uint64_t)pair_rows * out_dim * sizeof(float);

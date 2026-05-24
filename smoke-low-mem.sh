@@ -14,13 +14,11 @@ set -u
 CTX="${1:-1024}"
 TOKENS="${2:-1}"
 PROMPT="${3:-Hi}"
-# Default to the K=16 shrunken GGUF (~13.7 GiB, expected 2 mmap views @ ~6.85
-# GiB each).  K=48 (22 GiB / 3 views) reached layer 15/16 then OOM'd because the
-# wired model-view union + file_backed pages saturated the 16 GiB.  K=16 trades
-# routing quality for headroom: top-6 router picks from 16 kept experts instead
-# of 256.  Quality regression is intentional and temporary — first goal is to
-# prove a token can emit at all on this hardware.  See notes/execution-log.md #50.
-MODEL="${DS4_MODEL:-./gguf/ds4flash-k16.gguf}"
+# Default to the full DeepSeek V4 Flash GGUF (81 GB).  K=16/K=24 shrunken
+# variants were deleted after #54 confirmed A1 PoC works end-to-end with all
+# 256 experts intact.  Going forward this script + smoke-watch.sh validate
+# the Path C / #55 A3 pre-pack scratch architecture against the real model.
+MODEL="${DS4_MODEL:-./gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf}"
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
 OUT_DIR="${DS4_SMOKE_OUT_DIR:-/tmp}"
@@ -50,13 +48,19 @@ echo "=== START $(date +%T) ==="
 # expected OOM around layer ~34; if that's a clean win we shrink further.
 # Set DS4_METAL_MODEL_MAX_VIEW_BYTES_OVERRIDE to disable, or to a different
 # byte cap (min 256 MiB).
-: "${DS4_METAL_MODEL_MAX_VIEW_BYTES_OVERRIDE:=3758096384}"  # 3.5 GiB
+: "${DS4_METAL_MODEL_MAX_VIEW_BYTES_OVERRIDE:=2147483648}"  # 2 GiB; see #54-patch2
+# #55 A3 default-on: CPU-side memcpy active experts into resident scratch so
+# per-CB wireable peak is bounded by scratch size (~1.728 GiB) rather than
+# however many mmap-view buffers a layer's tensors happen to straddle.
+# Override with DS4_METAL_EXPERT_OFFLOAD=0 to A/B test the original path.
+: "${DS4_METAL_EXPERT_OFFLOAD:=1}"
 DS4_METAL_NO_RESIDENCY=1 \
 DS4_METAL_NO_MODEL_WARMUP=1 \
 DS4_METAL_NO_PREFILL_KERNEL_WARMUP=1 \
 DS4_METAL_PREFILL_SPLIT=1 \
 DS4_METAL_DECODE_SPLIT_EVERY=1 \
 DS4_METAL_MODEL_MAX_VIEW_BYTES="$DS4_METAL_MODEL_MAX_VIEW_BYTES_OVERRIDE" \
+DS4_METAL_EXPERT_OFFLOAD="$DS4_METAL_EXPERT_OFFLOAD" \
 DS4_DIAG=1 \
 ./ds4 -m "$MODEL" \
       -c "$CTX" \

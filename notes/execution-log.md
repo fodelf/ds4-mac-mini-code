@@ -12,12 +12,76 @@ Append-only chronological record of significant DS4 work — design docs, atomic
 
 ## Most recent
 
+- **2026-05-25** — #55-patch1 验证通过. Smoke 跑 `./smoke-watch.sh 1024 8 "1+1="`：prefill **0.39 t/s**（baseline 0.22 / A3-v1 broken 0.07 → 1.77× 超基线），decode **0.10 t/s**（5× 基线，维持），输出 `We need to answer the question: "` 质量一致。端到端 8 token 总耗时从 baseline ~8 min 缩到 ~2.2 min（3.7×）。Selective sync-read + bitmap dedupe + 按需 memcpy 架构确认正确。下一步候选：(a) 验证 longer prompt（256/512 token）prefill 是否同比例加速；(b) 验证 longer ctx（4096/16384/65536）是否稳定；(c) push 到 1M ctx（KV 增长是不同 bottleneck，需要单独评估）；(d) 用真实 coding prompt 跑端到端。Status: **A3 完成，等用户决定下一目标**。
+- **2026-05-25** — #55-patch1 A3 prefill 改 selective copy. 第一次 smoke：prefill 0.07 t/s（baseline 0.22 t/s，3× **regression**），decode 0.10 t/s（baseline 0.02 t/s，5× win），输出"We need to answer the question:..."质量未变。根因：v1 prefill 路径无条件拷贝全 256 个 routed-expert/层，但短 prompt（chat template 渲染后 ~15-20 token）路由实际只激活 ~60-120 个 expert/层；多拷的 130+ 个 expert 让 81 GB GGUF 通过 16 GB RAM 时疯狂 churn OS 文件缓存，~4× 多余 disk I/O。Fix：prefill 也走 decode 那种 selective 路径——`end_commands` 同步 → 读 `selectedbuf.contents`（n_tokens × n_expert ints）→ CPU bitmap dedupe（32 字节栈，最多 256 unique）→ `load_layer_experts_to_scratch(active_ids)` → `begin_commands` 开新 CB。代码：`ds4_metal.m:routed_moe_batch_tensor` 替换原来 `active_ids=NULL` 调用为完整 sync-readback + dedupe + selective copy。栈分配限制 `n_expert_total ≤ 1024`（DSv4 = 256，绰绰有余）。Build 绿。预期：短 prompt prefill ≥ baseline 0.22 t/s，长 prompt（1M ctx）退化为全拷且 per-CB wireable 仍 ≤ 1.728 GiB。Status: **landed**，等用户再跑 smoke。
+- **2026-05-25** — #55 A3 pre-pack scratch landed (code-only, validation pending). 实施合到一次 patch（#55a-e 合并）：在 `ds4_metal.m` 加 3 个 globals (`g_moe_scratch_gate/up/down`) + 配套 byte counters；加 helper `ds4_gpu_load_layer_experts_to_scratch(model_map, layer, n_active, active_ids, gate/up/down_offset, gate/down_expert_bytes, n_expert_total)`，`active_ids==NULL` 路径整 256 slot 一次 memcpy（prefill），`active_ids!=NULL` 路径按 id 列表 memcpy 单 slot（decode 6 个，~40 MiB/层）；加 env-gated 缓存检查 `ds4_gpu_expert_offload_enabled()`（一次性日志）。`routed_moe_one_tensor:13509+` 插入 A3 分支：若启用，先 `end_commands` 等 router 写完 → 读 `selectedbuf.contents[0..5]` 得 6 个 active id（验证 `storageMode==Shared`）→ `load_to_scratch` → 改绑 `g_moe_scratch_*` + offset=0 → `begin_commands` 开新 CB；`routed_moe_batch_tensor:13852+` 同模式但无 sync-read（unconditional 256 copy）。`cleanup` 加 3 nil + 3 zero。Scratch 用 Shared 存储（Apple Silicon 统一内存，无需 `didModifyRange`；偏离 memo 但语义等价）。Build 绿（`make` 通过，仅 pre-existing unused-function warning）。所有 5 binary 链接成功。**默认行为不变**——只在 `DS4_METAL_EXPERT_OFFLOAD=1` 时启用 A3 路径，关闭时跑老的 mmap-view 绑定。用户验证方法：`DS4_METAL_EXPERT_OFFLOAD=1 ./smoke-watch.sh 1024 8 "1+1="`，对比未启用时的 prefill 0.22 t/s / decode 0.02 t/s。预期 prefill 0.5-1.5 t/s（2-7×）、decode 0.2-1 t/s（10-50×），peak wireable 应稳定 ≤ 3.5 GiB。Status: **landed**（代码层面），等用户授权 smoke 验证。
 - **2026-05-24** — #52 view-shrink env var landed + 理论待验证. K=16 smoke 跑出关键数据：cb_alive=0, transient=0, drv=13800 MiB, pipelines=20 全程平稳——userland 和 Metal 驱动报告侧零增长，但 IOGPU CB#22 (layer 21) `kIOGPUCommandBufferCallbackErrorOutOfMemory`. autoreleasepool 假说被证伪。新假说有数据支撑：OOM 层数 ≈ 总层数 / view 数（80GB/10view→layer 7, 22GB/3view→layer 15, 13GB/2view→layer 21），暗示**IOGPU 维护 per-resource 累计 touched-pages map，view 第一次被 CB 引用时整 view 加进 IOGPU wireable 预算**，2 个 6.5 GiB view 加起来超 Mac M4/16GiB 的 ~12 GiB 内核 wireable 上限。补丁：`DS4_METAL_MODEL_MAX_VIEW_BYTES` 强制 view 上限（默认仍为 `[g_device maxBufferLength]`，约 8 GiB；最小 256 MiB；smoke 脚本默认 3.5 GiB → 5 view）。预测：5 view 应推到 layer ~34；如果推得动，再 shrink 到 2 GiB 看能否走完 43 层。代码改动仅 `ds4_metal.m:478-525` 一段 + `smoke-low-mem.sh` 多一个 env-var 透传。Build 绿，待用户跑。
 - **2026-05-24** — #51 加 Metal 内核态诊断探针 (DS4_DIAG=1 gated; build green). 两次 K=16 smoke 都 OOM 在 layer 21、system vmstat 全程冻结（wired=1430 MiB、file_backed=11069 MiB 不动）—— 这意味着 OOM 来自 Metal 驱动内核侧、跟系统 VM 解耦。`ds4_diag_vmstat` 看不到那里。新增 `ds4_diag_metal_state(tag)` 打印 `[g_device currentAllocatedSize]`、`g_transient_buffers.count`、`g_pending_cbs.count`、`g_pipeline_cache.count`、`g_model_buffer_cache.count`、CB 累计/活跃计数、`g_batch_cb/g_batch_enc/residency_set` 三个 nil 标志。CB 生命周期计数在 4 个创建点（`begin_commands` / `flush_commands` 新 CB / `command_buffer` 一次性 / `synchronize` 后备）和 2 个回收点（`finish_command_buffer` / `wait_pending_command_buffers`）配对维护，alive 数任何时刻反映"userland 仍持有强引用的 MTLCommandBuffer 数"。`finish_command_buffer` 也额外打 `dropped_transients` 数值，确认 transient 数组每次提交真的清零。`ds4_cuda.cu` 加空 stub，CPU 路径无 caller 故免改。下一步：用户跑 `./smoke-low-mem.sh` 看新 `metal[…]` 行随 21 层是涨什么。
 - **2026-05-24** — #50 K=16 GGUF 生成 + smoke 默认 MODEL 切换. K=48 (22.3 GiB) smoke 推进到 layer 15/16 仍 OOM —— per-layer CB split + warmup-skip 都生效，但 macOS Metal `newBufferWithBytesNoCopy` 的 ~8 GiB per-buffer cap 强制把 22.3 GiB 模型切成 3 个 ~7.4 GiB shared buffer，单 CB 触一个 buffer 即全 wire，wired ~10.5 GiB + file_backed ~4.2 GiB + system ≈ 15.8 GiB 顶满 16 GiB ceiling。用户决策"先保证第一个 token 为第一要义" → 暂时让步质量改用 K=16（256 中保留 16，6.2% routed expert slot）。三步离线流水线：`router_norms.py`（1.5s）→ `make_expert_mask.py --keep-top-k 16`（即时）→ `shrink_gguf.py --do-it`（41s，写 13.68 GB）。`smoke-low-mem.sh:20` 默认 MODEL 改 `./gguf/ds4flash-k16.gguf`。新文件 13 GB → 预期 2 个 buffer view @ ~6.85 GiB。
 - **2026-05-24** — #49 smoke 默认值校正 (script-only). `smoke-low-mem.sh` 默认 MODEL 从 `./ds4flash.gguf`（80 GiB / 10 个 mmap view）切到 `./gguf/ds4flash-k48.gguf`（22.3 GiB / 3 个 view），并新增 `DS4_METAL_NO_PREFILL_KERNEL_WARMUP=1`。诊断 trace（#48）显示 19:01 那次 smoke 实际跑的是 80 GiB 模型，且 prompt "Hi" 经 BOS+chat template 变 10 token 触发了 `metal_graph_warmup_prefill_kernels` 的 HC-attn 预热 matmul — 单个 CB 提交后 wired +9.1 GiB 永不释放，叠加 model-view 10 buffer 后 layer 7 必 OOM。无代码改动，env var 早已在 `ds4.c:11381` 就位。
 - **2026-05-24** — #48 诊断日志注入 patch landed (DS4_DIAG=1 gated; build green). vmstat snapshots + per-CB commit prints around prefill setup (alloc/steering/upload/warmup/prefill_layer_major/split-loop) so the next smoke pinpoints exactly which step OOMs. `smoke-low-mem.sh` now exports `DS4_DIAG=1` and post-runs greps for the new traces.
 - **2026-05-24** — #47 CB-split env-var patch landed (code-only, validation gated). Two opt-in env vars: `DS4_METAL_PREFILL_SPLIT=1` (forces per-layer CB during short-prompt prefill) + `DS4_METAL_DECODE_SPLIT_EVERY=1` (flushes after every N decode layers). Both default-off; no behavior change without opt-in. `smoke-low-mem.sh` updated to set both. Build + smoke pending explicit user authorization.
+
+## 2026-05-25 — #55 Path A3 设计 memo (per-layer expert pre-pack to scratch buffer)
+- **触发：** #54 A1 端到端通过但 prefill 0.22 t/s（77 min/1024 ctx）。用户选 Path (C) 奔 1M ctx 真能跑。A2 只解决 decode，prefill 还是 77 min 不变。A3 = prefill + decode 都改成 pre-pack 路径。
+
+### 设计目标
+1. **bound 单 CB wireable peak**：scratch (1.7 GiB) + 非 routed 张量 (~1.5 GiB) + KV ≈ **3.5 GiB 确定上限**，对比当前可能 7-10 GiB 的 view-级颗粒度溢出。
+2. **不改 Metal kernel**（关键决定）：scratch 仍呈"满 256-slot 张量"形态，kernel 看到的 layout 与今天一样，按 `ids[]` 索引。
+3. **prefill / decode 共用一条路径**，按 active expert 集合大小决定 memcpy 量。
+
+### 核心机制
+- 引擎初始化时分配 3 个 managed-storage MTLBuffer：
+  - `g_moe_scratch_gate` (528 MiB, 256 × 2.06 MiB)
+  - `g_moe_scratch_up` (528 MiB, 256 × 2.06 MiB)
+  - `g_moe_scratch_down` (672 MiB, 256 × 2.625 MiB)
+  - 合计 **1.728 GiB 常驻**，但是受控固定，wireable 完全可预测
+- 每层 forward 前的 marshalling 步骤（CPU 侧 memcpy）：
+  - **Prefill 路径** (`routed_moe_batch_tensor`)：memcpy 整层 256 个 expert 的 gate/up/down 数据从 `g_model_map_ptr + layer->ffn_*_exps->abs_offset` → scratch。memcpy 量 = 1.728 GiB/层。
+  - **Decode 路径** (`routed_moe_one_tensor`)：只 memcpy 6 个 active expert 的对应 slot。memcpy 量 = 40 MiB/层。其他 250 个 slot 保留上一层残留数据（kernel 不读，无害）。
+  - `[scratch didModifyRange:...]` 提交 CPU 写
+- 替换 kernel 输入：当前 `wrap_model_range(model_map, model_size, layer->ffn_*_exps->abs_offset, gate_tensor_bytes, &inner_offset)` 返回 mmap view buffer + inner_offset；A3 改成绑 `g_moe_scratch_*` + offset=0。
+- model view 注册保留（不动 `ds4_gpu_map_model_views`），只是 routed-expert 张量不再绑 view 进 CB。
+
+### 预期数字
+- **prefill memcpy 开销**：43 层 × 1.728 GiB = 74 GiB CPU memcpy @ ~8 GB/s 内存带宽 = **9 秒**（vs 当前 77 min prefill = 微不足道）
+- **decode memcpy 开销**：43 层 × 40 MiB = 1.7 GiB @ 8 GB/s = **0.2 秒/token**（vs 当前 50 s/token）
+- **prefill 加速估计**：消除 view-级 wire churn 后，**0.22 → 0.5-1.5 t/s（2-7×）**。disk I/O 24 sec 仍是物理底，预期 prefill 总时长降到 **15-30 min/1024 ctx**。
+- **decode 加速估计**：scratch wire 1.7 GiB 而不是整 view 3.5+ GiB，**0.02 → 0.2-1 t/s（10-50×）**。decode 总时长 50 → 1-5 s/token。
+
+### 文件改动清单（待批准后写）
+1. `ds4_metal.m`：
+   - +3 globals: `g_moe_scratch_gate/up/down` + `g_expert_offload_enabled`
+   - `ds4_gpu_set_model_map_range` 或独立 init：从首层 expert tensor 的 dims 算出 scratch 大小、allocate buffers
+   - 新 helper: `ds4_gpu_load_layer_experts_to_scratch(layer, n_active, active_ids[])` —— 按 active_ids 列表 memcpy 到 scratch 对应 slot
+   - `routed_moe_one_tensor:13439`：增分支，env-gated；before kernel dispatch 先调 load helper（decode 传 6 个 active）；改绑 scratch
+   - `routed_moe_batch_tensor:13783`：同上，prefill 传 256（all）
+2. `ds4.c`：可能无改动。如果 scratch 大小需要 engine 知道（snapshot/payload 之类），加一个 `ds4_gpu_get_moe_scratch_bytes()` 查询。
+3. `ds4_gpu.h`：可能加 1-2 个 prototype。
+4. **不改任何 .metal 文件**。
+
+### 风险
+1. **`MTLResourceStorageModeManaged` vs `Shared` 行为**：scratch 用 managed（CPU 写 + `didModifyRange` 通知 GPU 同步）。这是 Metal 标准做法，但需要验证 ARC 下 buffer 生命周期不出问题。
+2. **scratch 1.728 GiB 常驻**：16 GiB - OS 3 GiB - scratch 1.7 GiB - 非 routed view ~1.5 GiB = 9.8 GiB 余给 KV + file cache。1M ctx KV ~6.8 GiB 仍能装。
+3. **decode 残留数据**：上一层 250 slot 不被 kernel 读理论上无害，但如果有 prefetch / 越界访问就崩。survey 看 kernel 是严格按 `i02 = ids[idx]` 索引，应该 OK。需 build + 短跑验证。
+4. **route_translate kernel**：当前 keep_map 启用时会调度。A3 + 不用 expert_mask = keep_map 不启用 = route_translate 不调度。两条路径独立。
+5. **payload / snapshot 兼容性**：A3 不改 KV 布局，snapshot 应不受影响。但 `ds4_test --logprob-vectors` 验证一下是稳妥。
+
+### 工作量估计
+- 设计 memo: **已完成（本条目）**
+- 实施：4-5 小时聚焦工作（atomic patch 切 3-4 步：scratch alloc → load helper → one_tensor 接入 → batch_tensor 接入）
+- build & 单元验证（`ds4_test --metal-kernels`）：自动
+- 用户 smoke：1024 ctx 估计 15-30 min（vs 当前 77 min）
+
+### 实施步骤（提案，待批准）
+1. **#55a** scratch buffer alloc + lifecycle（init/free hooks）
+2. **#55b** load_layer_experts_to_scratch helper（memcpy + didModifyRange）
+3. **#55c** routed_moe_one_tensor 接入（decode 路径，6 active）
+4. **#55d** routed_moe_batch_tensor 接入（prefill 路径，256 active）
+5. **#55e** env-var gate `DS4_METAL_EXPERT_OFFLOAD=1` + log 打印 + smoke test
+- 每步 build 一次确认编译通过，但不跑 model（model load 测试由用户授权后做）
+
+- **Status:** 设计 memo 落地，**实施已合并到一次 patch（见 Most recent 顶部 2026-05-25 条目）**。代码层面 landed，等用户授权 smoke 验证。
 
 ## 2026-05-24 — #54 Path A 设计 memo (disk-offload routed experts)
 - **触发：** K=16/24/48 三档 smoke 完成后 (#53)，K=48 输出 `: 1+1=0? 1+1=0?`——语法对、算术错。K-shrink 路线确认有质量天花板：DS V4 Flash 训练分布是 top-6 from **256**，mask 掉 81% (K=48) 导致路由严重 OOD。继续升 K (K=64/96) 收益递减，**结构性问题需要换方向**。
@@ -50,6 +114,23 @@ Append-only chronological record of significant DS4 work — design docs, atomic
 - **#54-patch1 (2026-05-24 22:55)：** A1 首次 smoke 在 `ds4: Metal model needs more mapped views than expected` 停住——`ds4_metal.m:218` 静态上限 `DS4_METAL_MAX_MODEL_VIEWS=16`，81 GB / 3.5 GiB cap 需要 22 view 超过 16。上层 `ds4_gpu_map_model_views` 返回 0 后 caller 没干净退出（这是次要 bug，不修）。**Fix：** 上限 16 → 32（覆盖 32 × 3.5 = 112 GiB；32 × 默认 8.88 GiB = 284 GiB 也够）。`make` 通过 warning 一条无害（未用函数）。
 - **#54-patch1 验证：** prefill 进展到 layer ~24（cb_total=26）后 `kIOGPUCommandBufferCallbackErrorOutOfMemory`。drv=99 GiB（账面，不是实际 wired）。根因诊断：A1 单层 expert 数据 1.7 GiB（vs K=48 case 96 MB/层）经常跨 view，单 CB wireable peak 7-10 GiB，16 GiB 系统 OS 占 ~3 GiB 后余 13 GiB 不够。
 - **#54-patch2 (2026-05-24 22:59)：** view cap 进一步缩水到 2 GiB（每层 1.7 GiB > view 2 GiB → 每层都跨 view，但 peak 2×2=4 GiB vs 之前 7 GiB）。bump `MAX_MODEL_VIEWS` 32 → 64（覆盖 81/2=41 view + headroom）。view cap 通过 env var `DS4_METAL_MODEL_MAX_VIEW_BYTES_OVERRIDE=$((2*1024*1024*1024))` 在脚本侧传入，不改默认值。`make` 通过 warning 同前。判定：(i) 通过 → A1 PoC 成立；(i) 再 OOM → view-shrink 触顶，必须做 A3 pre-pack offload。
+- **#54 A1 端到端通过 (2026-05-25)：**
+  - smoke 1: `tokens=8` 跑通，43/43 prefill + 8 decode token，输出 `We need to answer the question: "`（合法英语 + reasoning preamble）。
+  - smoke 2: `tokens=64` 跑通，输出完整答案 `We need to answer the question: "1+1=?" This is a simple arithmetic question. The answer is 2. However, the user might be expecting a response. Since the instruction says "You are a helpful assistant", we should provide the correct answer. So, 1+1=2.` —— **真正 DeepSeek V4 Flash 水平**，K-shrink 路线完全够不上。
+  - 速度：prefill 0.22 t/s (= 77 min/1024 ctx)，decode 0.02 t/s (= 50 s/token)。慢但跑通。
+  - drv 平台 122452 MiB（账面 = 81 GB mmap + 视图重复登记），cb_alive 每 commit 后归零，全程无 OOM。
+- **判定确认（#54 设计 memo 三条标准）：**
+  1. **Quality 回归** ✅ —— 完整连贯 + 算术正确
+  2. **不 OOM** ✅ —— 2 GiB view cap + 64 view 上限稳定
+  3. **速度可承受** ⚠️ —— prefill < 30 min 没达到（77 min），但能跑完
+- **价值收获：**
+  1. 证伪了"K-shrink 路线足够"的假设，确认必须用全 256 expert 才有真质量
+  2. 证实了 view-shrink + per-layer CB split 可以撑住整 81 GB GGUF（虽然慢）
+  3. 16 GiB Mac Mini M4 跑完整 DS V4 Flash 在物理上**可行**（不是当初担心的"硬件不够"问题）
+- **代码改动只剩两处永久变更**（其他都是 env var 控制）：
+  - `ds4_metal.m:218` `DS4_METAL_MAX_MODEL_VIEWS` 16 → 64
+  - 无其他代码改动；K=16/24/48 GGUF 都没用了
+- **Status:** A1 PoC 完成，#54 关闭。下一步候选 (B) decode offload 或 (C) prefill offload，由用户决定方向。
 
 ## 2026-05-24 — #53 第一 token 跑通 + smoke-watch.sh live monitor 落地
 - **里程碑：** 16 GiB Mac Mini M4 在 K=16 + 3.5 GiB view-cap 配置下，**首个 token 成功 emit**。

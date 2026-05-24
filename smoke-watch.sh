@@ -18,14 +18,22 @@ set -u
 CTX="${1:-1024}"
 TOKENS="${2:-32}"
 PROMPT="${3:-Hi}"
-MODEL="${DS4_MODEL:-./gguf/ds4flash-k16.gguf}"
+# Default to the full DeepSeek V4 Flash GGUF (81 GB).  K=16/K=24 shrunken
+# models were deleted after #54 confirmed A1 PoC — see notes/execution-log.md
+# for the Path C decision.
+MODEL="${DS4_MODEL:-./gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf}"
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
 OUT_DIR="${DS4_SMOKE_OUT_DIR:-/tmp}"
 STDERR_LOG="$OUT_DIR/ds4-watch-$STAMP.stderr.log"
 STDOUT_LOG="$OUT_DIR/ds4-watch-$STAMP.stdout.log"
 
-: "${DS4_METAL_MODEL_MAX_VIEW_BYTES_OVERRIDE:=3758096384}"  # 3.5 GiB; see #52
+: "${DS4_METAL_MODEL_MAX_VIEW_BYTES_OVERRIDE:=2147483648}"  # 2 GiB; see #54-patch2
+# #55 A3 default-on for this script: routed-expert tensors are CPU-memcpy'd
+# into resident scratch each layer so per-CB wireable is bounded by scratch
+# size (1.728 GiB) instead of by view boundaries.  Override with
+# DS4_METAL_EXPERT_OFFLOAD=0 to A/B test against the original mmap-view path.
+: "${DS4_METAL_EXPERT_OFFLOAD:=1}"
 
 echo "smoke-watch: ctx=$CTX tokens=$TOKENS prompt=\"$PROMPT\" model=$MODEL"
 echo "smoke-watch: full stderr -> $STDERR_LOG"
@@ -33,6 +41,7 @@ echo "smoke-watch: full stdout -> $STDOUT_LOG"
 echo "smoke-watch: live stderr  = layer progress | OOM | finish[] | post-end metal[] | summary"
 echo "smoke-watch: live stdout  = raw generated tokens (prefix [stdout])"
 echo "smoke-watch: model view cap = $DS4_METAL_MODEL_MAX_VIEW_BYTES_OVERRIDE bytes"
+echo "smoke-watch: A3 expert offload = $DS4_METAL_EXPERT_OFFLOAD (1=pre-pack scratch, 0=mmap-view binding)"
 echo "=== START $(date +%T) ==="
 
 # Filter for the live-tail stderr stream.  Drops the high-frequency
@@ -45,7 +54,7 @@ echo "=== START $(date +%T) ==="
 #   - metal[end_commands] (final cleanup print)
 #   - prefill/generation t/s summary
 #   - residency / warmup / view-cap env verification on startup
-LIVE_FILTER='gpu prefill layer|gpu decode layer|command batch failed|OutOfMemory|finish\[|metal\[post-end-commit\]|metal\[end_commands\]|prefill:.*generation:|residency requested|model warmup|prefill kernel warmup|split-loop entering|prefill_layer_major|ds4: Metal'
+LIVE_FILTER='gpu prefill layer|gpu decode layer|command batch failed|OutOfMemory|finish\[|metal\[post-end-commit\]|metal\[end_commands\]|prefill:.*generation:|residency requested|model warmup|prefill kernel warmup|split-loop entering|prefill_layer_major|ds4: Metal|DS4_METAL_EXPERT_OFFLOAD|cannot open model'
 
 # Live-tail stdout in the background so generated tokens appear as the
 # model emits them.  Touch first so tail -f doesn't error on missing file.
@@ -67,6 +76,7 @@ DS4_METAL_NO_PREFILL_KERNEL_WARMUP=1 \
 DS4_METAL_PREFILL_SPLIT=1 \
 DS4_METAL_DECODE_SPLIT_EVERY=1 \
 DS4_METAL_MODEL_MAX_VIEW_BYTES="$DS4_METAL_MODEL_MAX_VIEW_BYTES_OVERRIDE" \
+DS4_METAL_EXPERT_OFFLOAD="$DS4_METAL_EXPERT_OFFLOAD" \
 DS4_DIAG=1 \
 ./ds4 -m "$MODEL" \
       -c "$CTX" \
