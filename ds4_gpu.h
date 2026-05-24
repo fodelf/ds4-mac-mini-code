@@ -45,6 +45,17 @@ int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t contex
 void ds4_gpu_set_quality(bool quality);
 void ds4_gpu_print_memory_report(const char *label);
 
+/* DS4_DIAG=1 turns on dense stderr diagnostics: vmstat snapshots and
+ * CB-commit prints around the prefill setup path so we can pinpoint
+ * where an OOM actually fires. Both helpers no-op when DS4_DIAG is unset.
+ * ds4_diag_enabled() caches the getenv() result on first call. */
+int ds4_diag_enabled(void);
+void ds4_diag_vmstat(const char *tag);
+/* #51 leak hunt: prints Metal-driver-side accounting (currentAllocatedSize,
+ * pipeline/model_view/transient counts, alive-CB counters). Only meaningful
+ * on the Metal backend; CPU/CUDA builds implement a stub. */
+void ds4_diag_metal_state(const char *tag);
+
 /* Upload the per-layer routed-MoE expert mask. mask is n_layers * n_expert
  * bytes, 1 byte per (layer, expert), 1=keep, 0=disable. Pass mask=NULL to
  * clear. Returns 1 on success. */

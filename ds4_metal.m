@@ -10,6 +10,9 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/sysctl.h>
+#include <mach/mach.h>
+#include <mach/mach_host.h>
+#include <mach/vm_statistics.h>
 
 #include "ds4.h"
 #include "ds4_gpu.h"
@@ -37,6 +40,16 @@ static id<MTLLibrary> g_library;
 static id<MTLCommandBuffer> g_batch_cb;
 static id<MTLComputeCommandEncoder> g_batch_enc;
 static NSMutableArray<id<MTLCommandBuffer>> *g_pending_cbs;
+/* #51 Metal-side leak hunt:
+ *  - cb_total_created  : monotonically increasing across all begin/flush
+ *  - cb_alive          : userland-strong refs to MTLCommandBuffer not yet drained
+ *  - transient_high    : peak g_transient_buffers count seen so far
+ *  - transient_added   : count added since last reset_added (per-CB delta)
+ * Updated only when DS4_DIAG=1; visibility cost is one fprintf per CB. */
+static uint64_t g_diag_cb_total_created;
+static uint64_t g_diag_cb_alive;
+static NSUInteger g_diag_transient_high;
+static NSUInteger g_diag_transient_added;
 static id<MTLComputePipelineState> g_set_rows_f32_i32_pipeline;
 static id<MTLComputePipelineState> g_get_rows_f32_pipeline;
 static id<MTLComputePipelineState> g_get_rows_f16_pipeline;
@@ -252,7 +265,13 @@ static id<MTLCommandBuffer> ds4_gpu_command_buffer(int *owned) {
         return g_batch_cb;
     }
     *owned = 1;
-    return [g_queue commandBuffer];
+    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+    if (cb) {
+        /* #51 one-shot CB: matched by ds4_gpu_finish_command_buffer decrement. */
+        g_diag_cb_total_created++;
+        g_diag_cb_alive++;
+    }
+    return cb;
 }
 
 static id<MTLComputeCommandEncoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer> cb) {
@@ -287,10 +306,16 @@ static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *labe
 
 static int ds4_gpu_wait_pending_command_buffers(const char *label) {
     int ok = 1;
+    const NSUInteger n_drained = g_pending_cbs ? g_pending_cbs.count : 0;
     for (id<MTLCommandBuffer> pending in g_pending_cbs) {
         if (!ds4_gpu_wait_command_buffer(pending, label)) ok = 0;
     }
     [g_pending_cbs removeAllObjects];
+    /* #51 each pending CB had alive++ at flush_commands; decrement here. */
+    if (n_drained > 0) {
+        if (g_diag_cb_alive >= n_drained) g_diag_cb_alive -= n_drained;
+        else g_diag_cb_alive = 0;
+    }
     return ok;
 }
 
@@ -300,7 +325,18 @@ static int ds4_gpu_finish_command_buffer(id<MTLCommandBuffer> cb, int owned, con
     [cb commit];
     int ok = ds4_gpu_wait_pending_command_buffers(label);
     if (!ds4_gpu_wait_command_buffer(cb, label)) ok = 0;
+    /* #51 record both the count we are about to drop (so we see per-CB churn)
+     * and the alive-CB counter decrement (one CB finished its userland life). */
+    const NSUInteger dropped = g_transient_buffers ? g_transient_buffers.count : 0;
     [g_transient_buffers removeAllObjects];
+    if (g_diag_cb_alive > 0) g_diag_cb_alive--;
+    if (ds4_diag_enabled()) {
+        fprintf(stderr,
+                "ds4_diag: finish[%s] dropped_transients=%lu cb_alive_after=%llu\n",
+                label ? label : "",
+                (unsigned long)dropped,
+                (unsigned long long)g_diag_cb_alive);
+    }
     return ok;
 }
 
@@ -461,6 +497,29 @@ static int ds4_gpu_map_model_views(
      * inside at least one view, so hot paths pass one buffer and one inner byte
      * offset. We never split a weight tensor across command encoders.
      */
+    /* #51 IOGPU touched-pages-per-resource theory.  K=16 OOM at layer 21
+     * lines up with "layer 21 is the first layer whose tensors live in view 1,
+     * and view 0 is still in IOGPU's per-resource page table" — both views are
+     * 6.5 GiB and the wireable budget on a 16 GiB Mac is ~12 GiB.  Shrink each
+     * view at the cost of more views to test the hypothesis.  Min 256 MiB so
+     * the overlap is still meaningful.  Cap honored only when smaller than the
+     * device maximum; the cap also has to leave room for the per-view overlap. */
+    const char *env_max_view = getenv("DS4_METAL_MODEL_MAX_VIEW_BYTES");
+    if (env_max_view && env_max_view[0]) {
+        uint64_t cap = strtoull(env_max_view, NULL, 0);
+        cap &= ~(page - 1);
+        if (cap >= (uint64_t)256 * 1024 * 1024 && cap < max_buffer) {
+            fprintf(stderr,
+                    "ds4: Metal model view max bytes overridden from %.2f GiB to %.2f GiB via DS4_METAL_MODEL_MAX_VIEW_BYTES\n",
+                    (double)max_buffer / (1024.0 * 1024.0 * 1024.0),
+                    (double)cap / (1024.0 * 1024.0 * 1024.0));
+            max_buffer = cap;
+        } else {
+            fprintf(stderr,
+                    "ds4: ignoring DS4_METAL_MODEL_MAX_VIEW_BYTES=%s (must be >=256 MiB and < device max %llu)\n",
+                    env_max_view, (unsigned long long)max_buffer);
+        }
+    }
     const uint64_t overlap = round_up_u64(DS4_METAL_MODEL_MAX_TENSOR_BYTES, page) + page;
     if (max_buffer == 0 || max_buffer <= overlap) {
         fprintf(stderr, "ds4: Metal maxBufferLength is too small for DS4 model views\n");
@@ -564,6 +623,12 @@ static id<MTLBuffer> ds4_gpu_new_transient_buffer(NSUInteger bytes, const char *
      * returns before the caller commits the command buffer.
      */
     [g_transient_buffers addObject:buffer];
+    /* #51 track per-CB transient growth so we can see if a specific layer
+     * dumps an outsized batch of helper buffers into the array. */
+    g_diag_transient_added++;
+    if (g_transient_buffers.count > g_diag_transient_high) {
+        g_diag_transient_high = g_transient_buffers.count;
+    }
     return buffer;
 }
 
@@ -1157,6 +1222,76 @@ void ds4_gpu_print_memory_report(const char *label) {
                           (uint64_t)g_moe_selected_compact_bytes),
             ds4_gpu_mib((uint64_t)g_f16_round_scratch_bytes),
             ds4_gpu_mib((uint64_t)g_raw_store_round_bytes));
+}
+
+int ds4_diag_enabled(void) {
+    static int cached = -1;
+    if (cached == -1) {
+        const char *v = getenv("DS4_DIAG");
+        cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
+void ds4_diag_vmstat(const char *tag) {
+    if (!ds4_diag_enabled()) return;
+    vm_size_t page_size = 0;
+    if (host_page_size(mach_host_self(), &page_size) != KERN_SUCCESS || page_size == 0) {
+        fprintf(stderr, "ds4_diag: vmstat[%s] host_page_size failed\n", tag ? tag : "");
+        return;
+    }
+    vm_statistics64_data_t vm_s;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                          (host_info64_t)&vm_s, &count) != KERN_SUCCESS) {
+        fprintf(stderr, "ds4_diag: vmstat[%s] host_statistics64 failed\n", tag ? tag : "");
+        return;
+    }
+    const double mib = (double)page_size / (1024.0 * 1024.0);
+    fprintf(stderr,
+            "ds4_diag: vmstat[%s] free=%.1f MiB wired=%.1f MiB file_backed=%.1f MiB compressed=%.1f MiB anon=%.1f MiB\n",
+            tag ? tag : "",
+            (double)vm_s.free_count * mib,
+            (double)vm_s.wire_count * mib,
+            (double)vm_s.external_page_count * mib,
+            (double)vm_s.compressor_page_count * mib,
+            (double)vm_s.internal_page_count * mib);
+}
+
+/* #51 leak hunt.  Prints what the system vmstat cannot see: the Metal driver's
+ * own tracked allocations, the userland CB ref-count, the transient/pipeline
+ * caches.  The K=16 OOM symptom is "system vmstat frozen but IOGPU OOM" — the
+ * answer must be in one of these counters.  Called only when DS4_DIAG=1. */
+void ds4_diag_metal_state(const char *tag) {
+    if (!ds4_diag_enabled()) return;
+    if (!g_device) {
+        fprintf(stderr, "ds4_diag: metal[%s] device=nil\n", tag ? tag : "");
+        return;
+    }
+    const NSUInteger drv_bytes      = [g_device currentAllocatedSize];
+    const NSUInteger transient_now  = g_transient_buffers ? g_transient_buffers.count : 0;
+    const NSUInteger pending_now    = g_pending_cbs       ? g_pending_cbs.count       : 0;
+    const NSUInteger pipelines_now  = g_pipeline_cache    ? g_pipeline_cache.count    : 0;
+    const NSUInteger model_views    = g_model_buffer_cache ? g_model_buffer_cache.count : 0;
+    const int batch_cb_live         = (g_batch_cb != nil) ? 1 : 0;
+    const int batch_enc_live        = (g_batch_enc != nil) ? 1 : 0;
+    const int residency_set_live    = (g_model_residency_set != nil) ? 1 : 0;
+    fprintf(stderr,
+            "ds4_diag: metal[%s] drv=%.1f MiB cb_total=%llu cb_alive=%llu batch_cb=%d batch_enc=%d "
+            "transient=%lu (high=%lu added_since_reset=%lu) pending_cbs=%lu pipelines=%lu model_views=%lu residency=%d\n",
+            tag ? tag : "",
+            (double)drv_bytes / (1024.0 * 1024.0),
+            (unsigned long long)g_diag_cb_total_created,
+            (unsigned long long)g_diag_cb_alive,
+            batch_cb_live,
+            batch_enc_live,
+            (unsigned long)transient_now,
+            (unsigned long)g_diag_transient_high,
+            (unsigned long)g_diag_transient_added,
+            (unsigned long)pending_now,
+            (unsigned long)pipelines_now,
+            (unsigned long)model_views,
+            residency_set_live);
 }
 
 void ds4_gpu_set_quality(bool quality) {
@@ -4102,6 +4237,16 @@ int ds4_gpu_begin_commands(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (g_batch_cb) return 0;
     g_batch_cb = [g_queue commandBuffer];
+    if (g_batch_cb) {
+        /* #51 reset per-CB transient counter and bump lifetime/alive counters. */
+        g_diag_cb_total_created++;
+        g_diag_cb_alive++;
+        g_diag_transient_added = 0;
+    }
+    if (ds4_diag_enabled()) {
+        fprintf(stderr, "ds4_diag: begin_commands cb=%p\n", (__bridge void *)g_batch_cb);
+        ds4_diag_metal_state("begin_commands");
+    }
     return g_batch_cb != nil;
 }
 
@@ -4112,6 +4257,11 @@ int ds4_gpu_flush_commands(void) {
     ds4_gpu_close_batch_encoder();
     id<MTLCommandBuffer> cb = g_batch_cb;
     g_batch_cb = nil;
+    if (ds4_diag_enabled()) {
+        ds4_diag_vmstat("pre-flush-commit");
+        ds4_diag_metal_state("pre-flush-commit");
+        fprintf(stderr, "ds4_diag: flush_commands committing cb=%p\n", (__bridge void *)cb);
+    }
     [cb commit];
     [g_pending_cbs addObject:cb];
 
@@ -4121,6 +4271,15 @@ int ds4_gpu_flush_commands(void) {
         [g_transient_buffers removeAllObjects];
         return 0;
     }
+    /* #51 the flushed CB stays alive in g_pending_cbs *and* a new one was
+     * created, so the alive counter grows by 1 net.  Track both. */
+    g_diag_cb_total_created++;
+    g_diag_cb_alive++;
+    g_diag_transient_added = 0;
+    if (ds4_diag_enabled()) {
+        ds4_diag_vmstat("post-flush-newcb");
+        ds4_diag_metal_state("post-flush-newcb");
+    }
     return 1;
 }
 
@@ -4129,7 +4288,18 @@ int ds4_gpu_end_commands(void) {
     ds4_gpu_close_batch_encoder();
     id<MTLCommandBuffer> cb = g_batch_cb;
     g_batch_cb = nil;
-    return ds4_gpu_finish_command_buffer(cb, 1, "command batch");
+    if (ds4_diag_enabled()) {
+        ds4_diag_vmstat("pre-end-commit");
+        ds4_diag_metal_state("pre-end-commit");
+        fprintf(stderr, "ds4_diag: end_commands committing cb=%p\n", (__bridge void *)cb);
+    }
+    int ok = ds4_gpu_finish_command_buffer(cb, 1, "command batch");
+    if (ds4_diag_enabled()) {
+        ds4_diag_vmstat("post-end-commit");
+        ds4_diag_metal_state("post-end-commit");
+        fprintf(stderr, "ds4_diag: end_commands done ok=%d\n", ok);
+    }
+    return ok;
 }
 
 int ds4_gpu_synchronize(void) {
@@ -4143,6 +4313,9 @@ int ds4_gpu_synchronize(void) {
 
     id<MTLCommandBuffer> cb = [g_queue commandBuffer];
     if (!cb) return 0;
+    /* #51 matched by finish_command_buffer decrement. */
+    g_diag_cb_total_created++;
+    g_diag_cb_alive++;
     return ds4_gpu_finish_command_buffer(cb, 1, "synchronize");
 }
 

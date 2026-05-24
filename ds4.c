@@ -8709,7 +8709,16 @@ static bool metal_graph_load_directional_steering(
         const char      *path,
         float            attn_scale,
         float            ffn_scale) {
-    if (attn_scale == 0.0f && ffn_scale == 0.0f) return true;
+    if (ds4_diag_enabled()) {
+        fprintf(stderr, "ds4_diag: load_directional_steering enter attn=%g ffn=%g path=%s\n",
+                (double)attn_scale, (double)ffn_scale, path ? path : "(null)");
+    }
+    if (attn_scale == 0.0f && ffn_scale == 0.0f) {
+        if (ds4_diag_enabled()) {
+            fprintf(stderr, "ds4_diag: load_directional_steering early-return (zero scales)\n");
+        }
+        return true;
+    }
 
     if (!path || !path[0]) {
         fprintf(stderr, "ds4: directional steering needs --dir-steering-file\n");
@@ -8939,6 +8948,12 @@ static bool metal_graph_alloc_raw_cap(
         uint32_t                ctx_size,
         uint32_t                prefill_cap,
         bool                    enable_mtp) {
+    if (ds4_diag_enabled()) {
+        fprintf(stderr,
+                "ds4_diag: alloc_raw_cap enter raw_cap=%u ctx_size=%u prefill_cap=%u mtp=%d\n",
+                raw_cap, ctx_size, prefill_cap, enable_mtp ? 1 : 0);
+        ds4_diag_vmstat("alloc_raw_cap-enter");
+    }
     memset(g, 0, sizeof(*g));
     g->mtp_enabled = enable_mtp;
     if (raw_cap == 0) raw_cap = 1;
@@ -9258,6 +9273,10 @@ static bool metal_graph_alloc_raw_cap(
                     g->batch_routed_mid && g->batch_routed_down &&
                     g->batch_routed_out;
     if (!ok) metal_graph_free(g);
+    if (ds4_diag_enabled()) {
+        fprintf(stderr, "ds4_diag: alloc_raw_cap exit ok=%d\n", ok ? 1 : 0);
+        ds4_diag_vmstat("alloc_raw_cap-exit");
+    }
     return ok;
 }
 
@@ -11120,6 +11139,20 @@ static bool metal_graph_encode_token_raw_swa(
         if (end != split_env && v <= DS4_N_LAYER) split_after_layers = (uint32_t)v;
     }
 
+    /*
+     * DS4_METAL_DECODE_SPLIT_EVERY adds a flush after every N decode layers on
+     * top of the single-shot pipelining split above. Same motivation as the
+     * prefill counterpart on a 16 GiB Mac Mini M4: cap the per-CB working set so
+     * the IOGPU allocator does not have to wire a full forward pass at once.
+     */
+    uint32_t split_every = 0;
+    const char *split_every_env = getenv("DS4_METAL_DECODE_SPLIT_EVERY");
+    if (split_every_env && split_every_env[0]) {
+        char *end = NULL;
+        unsigned long v = strtoul(split_every_env, &end, 10);
+        if (end != split_every_env && v <= DS4_N_LAYER) split_every = (uint32_t)v;
+    }
+
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         ok = metal_graph_encode_decode_layer(g,
                                              model,
@@ -11134,7 +11167,13 @@ static bool metal_graph_encode_token_raw_swa(
         ds4_gpu_tensor *tmp = g->cur_hc;
         g->cur_hc = g->after_ffn_hc;
         g->after_ffn_hc = tmp;
-        if (ok && allow_split_flush && split_after_layers != 0 && il + 1u == split_after_layers) {
+        const uint32_t layers_done = il + 1u;
+        const bool single_split_hit =
+            split_after_layers != 0 && layers_done == split_after_layers;
+        const bool every_split_hit =
+            split_every != 0 && layers_done < DS4_N_LAYER &&
+            (layers_done % split_every) == 0;
+        if (ok && allow_split_flush && (single_split_hit || every_split_hit)) {
             ok = ds4_gpu_flush_commands() != 0;
         }
     }
@@ -11296,7 +11335,10 @@ static bool metal_graph_upload_prompt_embeddings_hc(
     }
 
     if (tokens && n_tokens >= gpu_min) {
-        return ds4_gpu_embed_tokens_hc_tensor(out_hc,
+        if (ds4_diag_enabled()) {
+            fprintf(stderr, "ds4_diag: upload_prompt_embeddings_hc n_tokens=%u branch=GPU\n", n_tokens);
+        }
+        const int rc = ds4_gpu_embed_tokens_hc_tensor(out_hc,
                                                 tokens,
                                                 model->map,
                                                 model->size,
@@ -11304,15 +11346,26 @@ static bool metal_graph_upload_prompt_embeddings_hc(
                                                 (uint32_t)weights->token_embd->dim[1],
                                                 n_tokens,
                                                 DS4_N_EMBD,
-                                                DS4_N_HC) != 0;
+                                                DS4_N_HC);
+        if (ds4_diag_enabled()) {
+            fprintf(stderr, "ds4_diag: upload_prompt_embeddings_hc exit rc=%d\n", rc);
+        }
+        return rc != 0;
     }
 
-    return metal_graph_upload_prompt_embeddings_hc_cpu(out_hc,
+    if (ds4_diag_enabled()) {
+        fprintf(stderr, "ds4_diag: upload_prompt_embeddings_hc n_tokens=%u branch=CPU\n", n_tokens);
+    }
+    const bool ok = metal_graph_upload_prompt_embeddings_hc_cpu(out_hc,
                                                        model,
                                                        weights,
                                                        prompt,
                                                        pos0,
                                                        n_tokens);
+    if (ds4_diag_enabled()) {
+        fprintf(stderr, "ds4_diag: upload_prompt_embeddings_hc exit ok=%d\n", ok ? 1 : 0);
+    }
+    return ok;
 }
 
 static bool metal_graph_warmup_prefill_kernels(
@@ -11321,14 +11374,28 @@ static bool metal_graph_warmup_prefill_kernels(
         const ds4_weights *weights,
         uint32_t           n_tokens) {
     static bool warmed = false;
-    if (warmed || getenv("DS4_METAL_NO_PREFILL_KERNEL_WARMUP") != NULL) return true;
+    if (ds4_diag_enabled()) {
+        fprintf(stderr, "ds4_diag: warmup_prefill_kernels enter n_tokens=%u warmed=%d\n",
+                n_tokens, warmed ? 1 : 0);
+    }
+    if (warmed || getenv("DS4_METAL_NO_PREFILL_KERNEL_WARMUP") != NULL) {
+        if (ds4_diag_enabled()) {
+            fprintf(stderr, "ds4_diag: warmup_prefill_kernels early-return (already warm or disabled)\n");
+        }
+        return true;
+    }
 
     /*
      * The first batched F16 matmul can pay Metal's one-time pipeline execution
      * cost. Run the same HC attention projection on scratch storage before the
      * measured prefill. The output is overwritten by the real graph.
      */
-    if (n_tokens <= 8) return true;
+    if (n_tokens <= 8) {
+        if (ds4_diag_enabled()) {
+            fprintf(stderr, "ds4_diag: warmup_prefill_kernels early-return n_tokens<=8\n");
+        }
+        return true;
+    }
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
@@ -13564,7 +13631,15 @@ static bool metal_graph_prefill_layer_major(
         ds4_imatrix_collector *imatrix) {
     if (n_tokens <= 0 || n_tokens > prompt->len || (uint32_t)n_tokens > g->prefill_cap) return false;
 
+    if (ds4_diag_enabled()) {
+        fprintf(stderr,
+                "ds4_diag: prefill_layer_major enter n_tokens=%d prefill_cap=%u imatrix=%d\n",
+                n_tokens, g->prefill_cap, imatrix ? 1 : 0);
+        ds4_diag_vmstat("prefill_layer_major-enter");
+    }
+
     bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, prompt, 0, (uint32_t)n_tokens);
+    if (ds4_diag_enabled()) fprintf(stderr, "ds4_diag: upload_prompt_tokens ok=%d\n", ok ? 1 : 0);
     if (!ok) return false;
 
     if (!metal_graph_warmup_prefill_kernels(g, model, weights, (uint32_t)n_tokens)) return false;
@@ -13575,8 +13650,24 @@ static bool metal_graph_prefill_layer_major(
      * to watchdog WindowServer. Keep short prompts in one command buffer for
      * low overhead, but submit long prompts layer by layer so the display
      * server gets regular scheduling points.
+     *
+     * DS4_METAL_PREFILL_SPLIT additionally forces the layer-major per-CB path
+     * for short prompts. On a 16 GiB Mac Mini M4 the single-CB short-prefill
+     * commit has to wire the union of every layer's referenced GPU buffers in
+     * one shot (~14 GiB working set), which exceeds the IOGPU command-buffer
+     * allocator and fails with kIOGPUCommandBufferCallbackErrorOutOfMemory.
+     * Per-layer CBs cap working set at ~one layer (~300 MiB) and let Mach
+     * reclaim file-backed weight pages between commits.
      */
-    const bool split_commands = split_profile || n_tokens > 2048 || imatrix != NULL;
+    const bool split_env = getenv("DS4_METAL_PREFILL_SPLIT") != NULL;
+    const bool split_commands = split_env || split_profile || n_tokens > 2048 || imatrix != NULL;
+    if (ds4_diag_enabled()) {
+        fprintf(stderr,
+                "ds4_diag: prefill_layer_major split_commands=%d (split_env=%d split_profile=%d n>2048=%d imatrix=%d)\n",
+                split_commands ? 1 : 0,
+                split_env ? 1 : 0, split_profile ? 1 : 0,
+                n_tokens > 2048 ? 1 : 0, imatrix ? 1 : 0);
+    }
     const bool profile = getenv("DS4_METAL_GRAPH_PREFILL_PROFILE") != NULL || split_profile;
     const double t0 = profile ? now_sec() : 0.0;
     double encode_s = 0.0;
@@ -13683,7 +13774,15 @@ static bool metal_graph_prefill_layer_major(
         return false;
     }
 
+    if (ds4_diag_enabled()) {
+        fprintf(stderr, "ds4_diag: split-loop entering DS4_N_LAYER=%u\n", (uint32_t)DS4_N_LAYER);
+        ds4_diag_vmstat("split-loop-enter");
+    }
+
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        if (ds4_diag_enabled()) {
+            fprintf(stderr, "ds4_diag: split-loop il=%u pre-begin\n", il);
+        }
         if (split_profile) {
             const double t_attn0 = now_sec();
             ok = ds4_gpu_begin_commands() != 0;

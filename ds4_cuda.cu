@@ -1568,6 +1568,31 @@ extern "C" void ds4_gpu_print_memory_report(const char *label) {
             label ? label : "", (double)free_b / 1048576.0, (double)total_b / 1048576.0);
 }
 
+extern "C" int ds4_diag_enabled(void) {
+    static int cached = -1;
+    if (cached == -1) {
+        const char *v = getenv("DS4_DIAG");
+        cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
+extern "C" void ds4_diag_vmstat(const char *tag) {
+    if (!ds4_diag_enabled()) return;
+    size_t free_b = 0, total_b = 0;
+    (void)cudaMemGetInfo(&free_b, &total_b);
+    fprintf(stderr,
+            "ds4_diag: cudamem[%s] free=%.1f MiB total=%.1f MiB\n",
+            tag ? tag : "",
+            (double)free_b / 1048576.0,
+            (double)total_b / 1048576.0);
+}
+
+/* CUDA build does not track per-CB Metal state; stub so callers stay portable. */
+extern "C" void ds4_diag_metal_state(const char *tag) {
+    (void)tag;
+}
+
 extern "C" int ds4_gpu_set_expert_mask(const uint8_t *mask, uint32_t n_layers, uint32_t n_expert) {
     (void)n_layers; (void)n_expert;
     if (!mask) return 1;
