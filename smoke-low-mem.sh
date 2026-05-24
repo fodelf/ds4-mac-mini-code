@@ -27,9 +27,23 @@ STDOUT_LOG="$OUT_DIR/ds4-smoke-$STAMP.stdout.log"
 VMSTAT_BEFORE="$OUT_DIR/ds4-smoke-$STAMP.vmstat-before.txt"
 VMSTAT_AFTER="$OUT_DIR/ds4-smoke-$STAMP.vmstat-after.txt"
 
-echo "smoke: ctx=$CTX tokens=$TOKENS prompt=\"$PROMPT\" model=$MODEL"
+# Optional prompt-file override (same convention as smoke-watch.sh).
+if [ -n "${DS4_PROMPT_FILE:-}" ]; then
+    if [ ! -f "$DS4_PROMPT_FILE" ]; then
+        echo "smoke: DS4_PROMPT_FILE=$DS4_PROMPT_FILE does not exist" >&2
+        exit 2
+    fi
+    PROMPT_ARG=(--prompt-file "$DS4_PROMPT_FILE")
+    PROMPT_DESC="file=$DS4_PROMPT_FILE ($(wc -c < "$DS4_PROMPT_FILE") bytes)"
+else
+    PROMPT_ARG=(-p "$PROMPT")
+    PROMPT_DESC="prompt=\"$PROMPT\""
+fi
+
+echo "smoke: ctx=$CTX tokens=$TOKENS $PROMPT_DESC model=$MODEL"
 echo "smoke: stderr -> $STDERR_LOG"
 echo "smoke: stdout -> $STDOUT_LOG"
+echo "smoke: Ctrl+C 干净中断 (会 SIGTERM ds4，最多等 3 s 再 SIGKILL，然后跑 summary)"
 
 vm_stat > "$VMSTAT_BEFORE"
 
@@ -54,6 +68,29 @@ echo "=== START $(date +%T) ==="
 # however many mmap-view buffers a layer's tensors happen to straddle.
 # Override with DS4_METAL_EXPERT_OFFLOAD=0 to A/B test the original path.
 : "${DS4_METAL_EXPERT_OFFLOAD:=1}"
+DS4_PID=""
+INTERRUPTED=0
+
+on_interrupt() {
+    INTERRUPTED=1
+    echo
+    echo "=== INTERRUPT $(date +%T) — forwarding SIGTERM to ds4 (PID=$DS4_PID) ==="
+    if [ -n "$DS4_PID" ]; then
+        kill -TERM "$DS4_PID" 2>/dev/null
+        for _ in 1 2 3 4 5 6; do
+            kill -0 "$DS4_PID" 2>/dev/null || break
+            sleep 0.5
+        done
+        if kill -0 "$DS4_PID" 2>/dev/null; then
+            echo "smoke: ds4 didn't respond to SIGTERM in 3 s — SIGKILL"
+            kill -KILL "$DS4_PID" 2>/dev/null
+        fi
+    fi
+}
+trap on_interrupt INT TERM
+
+# Background ds4 so the wait is signal-interruptible; otherwise bash defers
+# trap delivery until the foreground child exits on its own.
 DS4_METAL_NO_RESIDENCY=1 \
 DS4_METAL_NO_MODEL_WARMUP=1 \
 DS4_METAL_NO_PREFILL_KERNEL_WARMUP=1 \
@@ -66,10 +103,20 @@ DS4_DIAG=1 \
       -c "$CTX" \
       -n "$TOKENS" \
       --temp 0 \
-      -p "$PROMPT" \
+      "${PROMPT_ARG[@]}" \
   > "$STDOUT_LOG" \
-  2> >(tee "$STDERR_LOG" >&2)
+  2> >(tee "$STDERR_LOG" >&2) &
+DS4_PID=$!
+
+wait "$DS4_PID" 2>/dev/null
 rc=$?
+while kill -0 "$DS4_PID" 2>/dev/null; do
+    wait "$DS4_PID" 2>/dev/null
+    rc=$?
+done
+if [ "$INTERRUPTED" -eq 1 ]; then
+    rc=130
+fi
 echo "=== END   $(date +%T) rc=$rc ==="
 
 vm_stat > "$VMSTAT_AFTER"

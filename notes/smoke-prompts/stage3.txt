@@ -1,0 +1,182 @@
+Review this C ring buffer implementation carefully. List every correctness defect — race conditions, undefined behavior, off-by-one, incorrect arithmetic, broken edge cases. For each defect, give the file + line range and a precise explanation of the failure mode (what input triggers it, what symptom the user sees). Sort by severity: silent data loss/corruption > crashes / undefined behavior > thread-safety failures > error-path resource leaks > inefficiency. Don't include style or naming suggestions. Don't include defects that exist only in hypothetical extensions of the code.
+
+```c
+/* ring_buffer.h */
+#ifndef RING_BUFFER_H
+#define RING_BUFFER_H
+
+#include <stdint.h>
+#include <stdatomic.h>
+#include <stdbool.h>
+#include <stddef.h>
+
+typedef struct ring_buffer {
+    uint8_t       *data;
+    size_t         capacity;
+    atomic_size_t  head;
+    atomic_size_t  tail;
+    bool           overwrite;
+} ring_buffer;
+
+/* Single-producer / single-consumer ring buffer.  Capacity is fixed at init.
+ * When overwrite=true and the buffer is full, new writes silently drop the
+ * oldest data.  When overwrite=false, writes that would exceed capacity are
+ * truncated.  All operations are O(1) and use no locks. */
+void   rb_init(ring_buffer *rb, size_t capacity, bool overwrite);
+void   rb_free(ring_buffer *rb);
+size_t rb_write(ring_buffer *rb, const void *buf, size_t len);
+size_t rb_read(ring_buffer *rb, void *buf, size_t len);
+size_t rb_available(ring_buffer *rb);
+size_t rb_space(ring_buffer *rb);
+void   rb_clear(ring_buffer *rb);
+
+#endif
+```
+
+```c
+/* ring_buffer.c */
+#include "ring_buffer.h"
+#include <stdlib.h>
+#include <string.h>
+
+void rb_init(ring_buffer *rb, size_t capacity, bool overwrite) {
+    rb->data = malloc(capacity);
+    rb->capacity = capacity;
+    atomic_store(&rb->head, 0);
+    atomic_store(&rb->tail, 0);
+    rb->overwrite = overwrite;
+}
+
+void rb_free(ring_buffer *rb) {
+    free(rb->data);
+}
+
+size_t rb_available(ring_buffer *rb) {
+    size_t h = atomic_load(&rb->head);
+    size_t t = atomic_load(&rb->tail);
+    return h - t;
+}
+
+size_t rb_space(ring_buffer *rb) {
+    return rb->capacity - rb_available(rb);
+}
+
+size_t rb_write(ring_buffer *rb, const void *buf, size_t len) {
+    const uint8_t *p = buf;
+    size_t space = rb_space(rb);
+
+    if (len > space) {
+        if (rb->overwrite) {
+            size_t drop = len - space;
+            atomic_fetch_add(&rb->tail, drop);
+        } else {
+            len = space;
+        }
+    }
+
+    size_t h = atomic_load(&rb->head);
+    size_t off = h % rb->capacity;
+
+    if (off + len <= rb->capacity) {
+        memcpy(rb->data + off, p, len);
+    } else {
+        size_t first = rb->capacity - off;
+        memcpy(rb->data + off, p, first);
+        memcpy(rb->data, p + first, len - first);
+    }
+
+    atomic_fetch_add(&rb->head, len);
+    return len;
+}
+
+size_t rb_read(ring_buffer *rb, void *buf, size_t len) {
+    uint8_t *p = buf;
+    size_t avail = rb_available(rb);
+
+    if (len > avail) len = avail;
+
+    size_t t = atomic_load(&rb->tail);
+    size_t off = t % rb->capacity;
+
+    if (off + len <= rb->capacity) {
+        memcpy(p, rb->data + off, len);
+    } else {
+        size_t first = rb->capacity - off;
+        memcpy(p, rb->data + off, first);
+        memcpy(p + first, rb->data, len - first);
+    }
+
+    atomic_fetch_add(&rb->tail, len);
+    return len;
+}
+
+void rb_clear(ring_buffer *rb) {
+    size_t h = atomic_load(&rb->head);
+    atomic_store(&rb->tail, h);
+}
+```
+
+```c
+/* ring_buffer_test.c */
+#include "ring_buffer.h"
+#include <pthread.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+
+static void *writer_thread(void *arg) {
+    ring_buffer *rb = arg;
+    uint8_t buf[64];
+    for (int i = 0; i < 1000; i++) {
+        memset(buf, i & 0xff, sizeof(buf));
+        rb_write(rb, buf, sizeof(buf));
+    }
+    return NULL;
+}
+
+static void *reader_thread(void *arg) {
+    ring_buffer *rb = arg;
+    uint8_t buf[32];
+    int read_total = 0;
+    while (read_total < 1000 * 64) {
+        size_t n = rb_read(rb, buf, sizeof(buf));
+        read_total += n;
+    }
+    return NULL;
+}
+
+int main(void) {
+    ring_buffer rb;
+    rb_init(&rb, 4096, false);
+
+    pthread_t w, r;
+    pthread_create(&w, NULL, writer_thread, &rb);
+    pthread_create(&r, NULL, reader_thread, &rb);
+
+    pthread_join(w, NULL);
+    pthread_join(r, NULL);
+
+    rb_free(&rb);
+    return 0;
+}
+```
+
+Specific things to examine — answer each:
+
+1. The header comment promises "single-producer / single-consumer" semantics. Does the implementation actually deliver SPSC safety? Walk through what happens if the producer's `rb_space()` reads a stale tail while the consumer is mid-`rb_read`.
+
+2. `rb_write` in overwrite mode calls `atomic_fetch_add(&rb->tail, drop)` — what concurrency rule does this break? What does the consumer see if it is currently inside `rb_read`?
+
+3. The non-overwrite branch sets `len = space` then writes — what happens on the very first call when `len == 0` is returned to the caller? Does the caller have a way to distinguish "buffer is full" from "caller asked for zero bytes"?
+
+4. `rb_available` returns `h - t` with no modular arithmetic. When does this give the wrong answer?
+
+5. Is `rb_init` exception-safe in C terms (i.e., what happens if `malloc` returns NULL)?
+
+6. The test driver: the writer pushes `1000 * 64 = 64000` bytes total. The reader exits after reading `1000 * 64` bytes. Will this test ever terminate? If yes, under what timing? If no, why?
+
+7. Memory ordering: every atomic op uses the default `memory_order_seq_cst`. Is that the right choice for SPSC, or can looser orders be used? Don't answer "looser is fine" — explain exactly which load/store pairs need release/acquire to maintain correctness of the data writes.
+
+8. What happens to `rb_clear` if it races with `rb_write`?
+
+For each defect, end with: "User-visible symptom: ...". For example, "User-visible symptom: read returns garbage bytes from a partially-overwritten slot."

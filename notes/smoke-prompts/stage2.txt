@@ -1,0 +1,99 @@
+Review this C command-line parser carefully. List every bug you find. For each bug, give the line range and explain why it is a bug — not a style preference, an actual defect that produces wrong behavior or undefined behavior. Don't suggest improvements, just identify defects.
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
+
+typedef struct {
+    const char *input_path;
+    const char *output_path;
+    int        verbosity;
+    bool       force;
+    int        max_lines;
+} cli_options;
+
+static int parse_int(const char *s, int fallback) {
+    if (!s || !*s) return fallback;
+    char *end;
+    long v = strtol(s, &end, 10);
+    if (*end != '\0') return fallback;
+    if (v < INT_MIN || v > INT_MAX) return fallback;
+    return (int)v;
+}
+
+static cli_options parse_cli(int argc, char **argv) {
+    cli_options o = {0};
+    o.max_lines = -1;
+
+    for (int i = 1; i < argc; i++) {
+        const char *arg = argv[i];
+        if (!strcmp(arg, "-v") || !strcmp(arg, "--verbose")) {
+            o.verbosity++;
+        } else if (!strcmp(arg, "-f") || !strcmp(arg, "--force")) {
+            o.force = true;
+        } else if (!strcmp(arg, "-o") || !strcmp(arg, "--output")) {
+            o.output_path = argv[++i];
+        } else if (!strcmp(arg, "-n") || !strcmp(arg, "--max-lines")) {
+            o.max_lines = parse_int(argv[i + 1], -1);
+            i++;
+        } else if (arg[0] == '-') {
+            fprintf(stderr, "unknown option: %s\n", arg);
+            exit(1);
+        } else {
+            o.input_path = arg;
+        }
+    }
+
+    if (!o.input_path) {
+        fprintf(stderr, "input path required\n");
+        exit(1);
+    }
+
+    return o;
+}
+
+int main(int argc, char **argv) {
+    cli_options o = parse_cli(argc, argv);
+
+    FILE *in = fopen(o.input_path, "r");
+    if (!in) {
+        perror(o.input_path);
+        return 1;
+    }
+
+    FILE *out = o.output_path ? fopen(o.output_path, "w") : stdout;
+    if (!out) {
+        perror(o.output_path);
+        fclose(in);
+        return 1;
+    }
+
+    char line[4096];
+    int n = 0;
+    while (fgets(line, sizeof(line), in)) {
+        if (o.max_lines >= 0 && n >= o.max_lines) break;
+        fputs(line, out);
+        n++;
+    }
+
+    fclose(in);
+    if (out != stdout) fclose(out);
+
+    if (o.verbosity > 0) {
+        fprintf(stderr, "copied %d lines\n", n);
+    }
+
+    return 0;
+}
+```
+
+Focus areas:
+- Argument parsing — what happens if `-o` is the last argv element with no value after it?
+- Header inclusions — what symbols are used but not declared by the included headers?
+- Integer overflow / range — does `parse_int` handle every edge case its name implies?
+- Multiple positional arguments — what happens if two non-option arguments are given?
+- Resource leaks on error paths.
+
+Sort bugs by severity (undefined behavior / crash > silent wrong output > error-path leak > minor edge case). Don't comment on style, formatting, or design choices.

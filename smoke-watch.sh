@@ -35,13 +35,29 @@ STDOUT_LOG="$OUT_DIR/ds4-watch-$STAMP.stdout.log"
 # DS4_METAL_EXPERT_OFFLOAD=0 to A/B test against the original mmap-view path.
 : "${DS4_METAL_EXPERT_OFFLOAD:=1}"
 
-echo "smoke-watch: ctx=$CTX tokens=$TOKENS prompt=\"$PROMPT\" model=$MODEL"
+# Optional prompt-file override.  When DS4_PROMPT_FILE is set, ds4 reads the
+# prompt from that path via --prompt-file (avoids stuffing 1k+ tokens on the
+# command line).  Falls back to -p "$PROMPT" when unset.
+if [ -n "${DS4_PROMPT_FILE:-}" ]; then
+    if [ ! -f "$DS4_PROMPT_FILE" ]; then
+        echo "smoke-watch: DS4_PROMPT_FILE=$DS4_PROMPT_FILE does not exist" >&2
+        exit 2
+    fi
+    PROMPT_ARG=(--prompt-file "$DS4_PROMPT_FILE")
+    PROMPT_DESC="file=$DS4_PROMPT_FILE ($(wc -c < "$DS4_PROMPT_FILE") bytes)"
+else
+    PROMPT_ARG=(-p "$PROMPT")
+    PROMPT_DESC="prompt=\"$PROMPT\""
+fi
+
+echo "smoke-watch: ctx=$CTX tokens=$TOKENS $PROMPT_DESC model=$MODEL"
 echo "smoke-watch: full stderr -> $STDERR_LOG"
 echo "smoke-watch: full stdout -> $STDOUT_LOG"
 echo "smoke-watch: live stderr  = layer progress | OOM | finish[] | post-end metal[] | summary"
 echo "smoke-watch: live stdout  = raw generated tokens (prefix [stdout])"
 echo "smoke-watch: model view cap = $DS4_METAL_MODEL_MAX_VIEW_BYTES_OVERRIDE bytes"
 echo "smoke-watch: A3 expert offload = $DS4_METAL_EXPERT_OFFLOAD (1=pre-pack scratch, 0=mmap-view binding)"
+echo "smoke-watch: Ctrl+C 干净中断 (会 SIGTERM ds4，最多等 3 s 再 SIGKILL，然后跑 post-mortem)"
 echo "=== START $(date +%T) ==="
 
 # Filter for the live-tail stderr stream.  Drops the high-frequency
@@ -62,14 +78,44 @@ LIVE_FILTER='gpu prefill layer|gpu decode layer|command batch failed|OutOfMemory
 tail -f "$STDOUT_LOG" | awk '{ printf "[stdout] %s\n", $0; fflush(); }' &
 TAIL_PID=$!
 
-# Make sure we tear the background tail down on any exit path.
-cleanup() {
-    kill "$TAIL_PID" 2>/dev/null
-    wait "$TAIL_PID" 2>/dev/null
+DS4_PID=""
+INTERRUPTED=0
+
+# EXIT trap: always reaps the background tail.  Runs after on_interrupt too.
+on_exit() {
+    if [ -n "$TAIL_PID" ]; then
+        kill "$TAIL_PID" 2>/dev/null
+        wait "$TAIL_PID" 2>/dev/null
+    fi
 }
-trap cleanup EXIT INT TERM
+trap on_exit EXIT
+
+# INT/TERM trap: forward signal to ds4 so generation stops cleanly, then let
+# the script fall through to the post-mortem (don't exit here — the user still
+# wants to see why it died and the last metal[] state).
+on_interrupt() {
+    INTERRUPTED=1
+    echo
+    echo "=== INTERRUPT $(date +%T) — forwarding SIGTERM to ds4 (PID=$DS4_PID) ==="
+    if [ -n "$DS4_PID" ]; then
+        kill -TERM "$DS4_PID" 2>/dev/null
+        # Give ds4 up to 3 s to flush diag + exit cleanly; SIGKILL after.
+        for _ in 1 2 3 4 5 6; do
+            kill -0 "$DS4_PID" 2>/dev/null || break
+            sleep 0.5
+        done
+        if kill -0 "$DS4_PID" 2>/dev/null; then
+            echo "smoke-watch: ds4 didn't respond to SIGTERM in 3 s — SIGKILL"
+            kill -KILL "$DS4_PID" 2>/dev/null
+        fi
+    fi
+}
+trap on_interrupt INT TERM
 
 # All the env vars from smoke-low-mem.sh; comments there explain each one.
+# Run ds4 in background so the `wait` is interruptible by SIGINT — without
+# this, bash blocks the trap until the foreground child returns, and Ctrl+C
+# only gets delivered after ds4 exits on its own (which defeats the point).
 DS4_METAL_NO_RESIDENCY=1 \
 DS4_METAL_NO_MODEL_WARMUP=1 \
 DS4_METAL_NO_PREFILL_KERNEL_WARMUP=1 \
@@ -82,14 +128,26 @@ DS4_DIAG=1 \
       -c "$CTX" \
       -n "$TOKENS" \
       --temp 0 \
-      -p "$PROMPT" \
+      "${PROMPT_ARG[@]}" \
   > "$STDOUT_LOG" \
-  2> >(tee "$STDERR_LOG" | grep --line-buffered -E "$LIVE_FILTER" | awk '{ printf "[ds4]    %s\n", $0; fflush(); }' >&2)
+  2> >(tee "$STDERR_LOG" | grep --line-buffered -E "$LIVE_FILTER" | awk '{ printf "[ds4]    %s\n", $0; fflush(); }' >&2) &
+DS4_PID=$!
+
+# Wait for ds4.  Capture rc on the FIRST wait (so we get ds4's real exit
+# code, not 127 from waiting on an already-reaped PID).  If a signal trap
+# interrupted wait but ds4 is still alive (zombie or running), keep waiting.
+wait "$DS4_PID" 2>/dev/null
 rc=$?
+while kill -0 "$DS4_PID" 2>/dev/null; do
+    wait "$DS4_PID" 2>/dev/null
+    rc=$?
+done
+if [ "$INTERRUPTED" -eq 1 ]; then
+    rc=130
+fi
 
 # Give the background stdout tail a tick to flush trailing tokens.
 sleep 0.3
-cleanup
 
 echo
 echo "=== END   $(date +%T) rc=$rc ==="

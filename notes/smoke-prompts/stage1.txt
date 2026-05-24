@@ -1,0 +1,20 @@
+Explain what this C function computes and identify any potential bugs. Keep your answer to three short paragraphs.
+
+```c
+#include <stdint.h>
+
+static uint64_t hash_bytes(const void *ptr, uint64_t len) {
+    const uint8_t *p = ptr;
+    uint64_t h = 1469598103934665603ull;
+    for (uint64_t i = 0; i < len; i++) {
+        h ^= p[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+```
+
+Questions:
+1. What hash algorithm is this and what are the named constants?
+2. Is there any correctness issue with how `len == 0` is handled?
+3. Would replacing the multiplication with a left-shift-and-xor change the output distribution? Be specific.
