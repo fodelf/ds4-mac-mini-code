@@ -13182,6 +13182,11 @@ static bool metal_graph_eval_token_raw_swa(
     const bool profile = getenv("DS4_METAL_GRAPH_TOKEN_PROFILE") != NULL;
     const double t0 = profile ? now_sec() : 0.0;
 
+    /* #58 Lvl 2: reset per-token A3 sync counters before the decode begins, then
+     * flush the breakdown after the read.  Cost is one accumulator zero/print
+     * pair; the timing points themselves are gated by DS4_DIAG inside the .m. */
+    ds4_gpu_diag_decode_token_begin();
+
     bool ok = ds4_gpu_begin_commands() != 0;
     if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights, token, pos, logits != NULL, true);
     const double t_encoded = profile ? now_sec() : 0.0;
@@ -13191,6 +13196,7 @@ static bool metal_graph_eval_token_raw_swa(
     if (ok && logits) {
         ok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
+    ds4_gpu_diag_decode_token_end((int)pos);
     if (profile) {
         const double t_read = now_sec();
         fprintf(stderr,

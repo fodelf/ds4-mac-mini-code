@@ -56,6 +56,14 @@ void ds4_diag_vmstat(const char *tag);
  * on the Metal backend; CPU/CUDA builds implement a stub. */
 void ds4_diag_metal_state(const char *tag);
 
+/* #58 Lvl 2: per-decode-token A3 sync-cost breakdown.  Called by the decode
+ * graph driver around each Metal-decoded token; on Metal the A3 routed-MoE
+ * path (routed_moe_one_tensor) accumulates gpu-wait, cpu-memcpy, and cb-open
+ * intervals into thread-local counters, printed once per token.  No-ops on
+ * CPU/CUDA builds and when DS4_DIAG is unset. */
+void ds4_gpu_diag_decode_token_begin(void);
+void ds4_gpu_diag_decode_token_end(int token_pos);
+
 /* Upload the per-layer routed-MoE expert mask. mask is n_layers * n_expert
  * bytes, 1 byte per (layer, expert), 1=keep, 0=disable. Pass mask=NULL to
  * clear. Returns 1 on success. */

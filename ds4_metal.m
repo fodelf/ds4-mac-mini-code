@@ -12,6 +12,7 @@
 #include <sys/sysctl.h>
 #include <mach/mach.h>
 #include <mach/mach_host.h>
+#include <mach/mach_time.h>
 #include <mach/vm_statistics.h>
 
 #include "ds4.h"
@@ -50,6 +51,19 @@ static uint64_t g_diag_cb_total_created;
 static uint64_t g_diag_cb_alive;
 static NSUInteger g_diag_transient_high;
 static NSUInteger g_diag_transient_added;
+
+/* #58 Lvl 2: per-decode-token A3 sync-cost accumulators.  Reset by
+ * ds4_gpu_diag_decode_token_begin (called from the decode driver before each
+ * token), incremented inside routed_moe_one_tensor's A3 branch (the only
+ * place that issues the end_commands → memcpy → begin_commands sync), and
+ * printed by ds4_gpu_diag_decode_token_end after the token's logits read.
+ * Updated only when DS4_DIAG=1 (each helper short-circuits). */
+static uint64_t g_diag_decode_a3_gpu_wait_ns;
+static uint64_t g_diag_decode_a3_cpu_memcpy_ns;
+static uint64_t g_diag_decode_a3_cb_open_ns;
+static uint32_t g_diag_decode_a3_layer_count;
+static mach_timebase_info_data_t g_diag_timebase;
+static int g_diag_timebase_initialized;
 static id<MTLComputePipelineState> g_set_rows_f32_i32_pipeline;
 static id<MTLComputePipelineState> g_get_rows_f32_pipeline;
 static id<MTLComputePipelineState> g_get_rows_f16_pipeline;
@@ -1309,6 +1323,52 @@ void ds4_diag_metal_state(const char *tag) {
             (unsigned long)pipelines_now,
             (unsigned long)model_views,
             residency_set_live);
+}
+
+/* #58 Lvl 2: convert mach_absolute_time tick delta into nanoseconds. */
+static uint64_t ds4_diag_ns_now(void) {
+    if (!g_diag_timebase_initialized) {
+        mach_timebase_info(&g_diag_timebase);
+        g_diag_timebase_initialized = 1;
+    }
+    const uint64_t mach = mach_absolute_time();
+    return mach * (uint64_t)g_diag_timebase.numer / (uint64_t)g_diag_timebase.denom;
+}
+
+/* #58 Lvl 2: reset per-decode-token A3 sync accumulators.  Called by the
+ * decode driver (metal_graph_eval_token_raw_swa) before encoding the token. */
+void ds4_gpu_diag_decode_token_begin(void) {
+    if (!ds4_diag_enabled()) return;
+    g_diag_decode_a3_gpu_wait_ns = 0;
+    g_diag_decode_a3_cpu_memcpy_ns = 0;
+    g_diag_decode_a3_cb_open_ns = 0;
+    g_diag_decode_a3_layer_count = 0;
+}
+
+/* #58 Lvl 2: print the per-decode-token A3 sync-cost summary.  Called by
+ * the decode driver after the token's logits read.  layer_count should be
+ * roughly the number of MoE layers (DSv4 = 43); a smaller value means the
+ * decode aborted mid-token or some layers took the non-A3 path. */
+void ds4_gpu_diag_decode_token_end(int token_pos) {
+    if (!ds4_diag_enabled()) return;
+    if (g_diag_decode_a3_layer_count == 0) return;
+    const uint64_t total_ns = g_diag_decode_a3_gpu_wait_ns +
+                              g_diag_decode_a3_cpu_memcpy_ns +
+                              g_diag_decode_a3_cb_open_ns;
+    const double per_layer = (double)g_diag_decode_a3_layer_count;
+    fprintf(stderr,
+            "ds4_diag: decode_token[pos=%d] a3_layers=%u total_a3_sync=%.1f ms "
+            "gpu_wait=%.1f ms cpu_memcpy=%.1f ms cb_open=%.1f ms | "
+            "per_layer gpu_wait=%.2f ms memcpy=%.2f ms cb_open=%.2f ms\n",
+            token_pos,
+            g_diag_decode_a3_layer_count,
+            (double)total_ns / 1.0e6,
+            (double)g_diag_decode_a3_gpu_wait_ns / 1.0e6,
+            (double)g_diag_decode_a3_cpu_memcpy_ns / 1.0e6,
+            (double)g_diag_decode_a3_cb_open_ns / 1.0e6,
+            (double)g_diag_decode_a3_gpu_wait_ns / per_layer / 1.0e6,
+            (double)g_diag_decode_a3_cpu_memcpy_ns / per_layer / 1.0e6,
+            (double)g_diag_decode_a3_cb_open_ns / per_layer / 1.0e6);
 }
 
 void ds4_gpu_set_quality(bool quality) {
@@ -13654,9 +13714,20 @@ int ds4_gpu_routed_moe_one_tensor(
          */
         if (ds4_gpu_expert_offload_enabled()) {
             const int was_batched = (g_batch_cb != nil);
+            /* #58 Lvl 2: timing the A3 sync path.  Three intervals per layer
+             * when was_batched (the steady-state decode case):
+             *   gpu_wait  = end_commands() — blocks until prior CB drains
+             *   cpu_memcpy = load_layer_experts_to_scratch — pure CPU memcpy
+             *   cb_open   = begin_commands() — Metal driver opens fresh CB
+             * Only the sum, taken across 43 layers per token, accounts for the
+             * observed ~8.6 s/token (= 1/0.09 t/s).  Zero overhead when DS4_DIAG
+             * is off (ds4_diag_enabled short-circuits). */
+            const int diag = ds4_diag_enabled();
+            const uint64_t t0 = diag ? ds4_diag_ns_now() : 0;
             if (was_batched) {
                 if (ds4_gpu_end_commands() == 0) return 0;
             }
+            const uint64_t t1 = diag ? ds4_diag_ns_now() : 0;
             if (selectedbuf.storageMode != MTLStorageModeShared) {
                 fprintf(stderr,
                         "ds4: A3 expert offload requires Shared-storage selected buffer (got mode %lu)\n",
@@ -13680,6 +13751,7 @@ int ds4_gpu_routed_moe_one_tensor(
                 if (was_batched) (void)ds4_gpu_begin_commands();
                 return 0;
             }
+            const uint64_t t2 = diag ? ds4_diag_ns_now() : 0;
             gate_buf = g_moe_scratch_gate;
             up_buf = g_moe_scratch_up;
             down_buf = g_moe_scratch_down;
@@ -13688,6 +13760,13 @@ int ds4_gpu_routed_moe_one_tensor(
             down_inner = 0;
             if (was_batched) {
                 if (ds4_gpu_begin_commands() == 0) return 0;
+            }
+            const uint64_t t3 = diag ? ds4_diag_ns_now() : 0;
+            if (diag && was_batched) {
+                g_diag_decode_a3_gpu_wait_ns   += (t1 - t0);
+                g_diag_decode_a3_cpu_memcpy_ns += (t2 - t1);
+                g_diag_decode_a3_cb_open_ns    += (t3 - t2);
+                g_diag_decode_a3_layer_count   += 1;
             }
         }
 
