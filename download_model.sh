@@ -15,6 +15,12 @@ case "$OUT_DIR" in
     *) OUT_DIR="$ROOT/$OUT_DIR" ;;
 esac
 TOKEN=${HF_TOKEN:-}
+# Mirror endpoint, follows the convention used by huggingface-cli / hf_hub.
+# In mainland China, set HF_ENDPOINT=https://hf-mirror.com to use a
+# 1:1 mirror that's reachable when huggingface.co is unreachable.
+HF_ENDPOINT=${HF_ENDPOINT:-"https://huggingface.co"}
+# Strip trailing slashes so we don't build URLs with "//".
+HF_ENDPOINT=${HF_ENDPOINT%/}
 
 usage() {
     cat <<EOF
@@ -59,6 +65,8 @@ Options:
 Environment:
   DS4_GGUF_DIR   Directory used for downloaded GGUF files.
                  Default: ./gguf
+  HF_ENDPOINT    Hugging Face endpoint override. Default: https://huggingface.co
+                 In mainland China, use: HF_ENDPOINT=https://hf-mirror.com
 
 After q2-imatrix/q4-imatrix/q2/q4 downloads the script updates:
   ./ds4flash.gguf -> <download directory>/<selected model>
@@ -125,7 +133,7 @@ download_one() {
     out="$OUT_DIR/$file"
     part="$out.part"
     aria2_part="$out.aria2"
-    url="https://huggingface.co/$REPO/resolve/main/$file"
+    url="$HF_ENDPOINT/$REPO/resolve/main/$file"
 
     mkdir -p "$OUT_DIR"
 
@@ -141,7 +149,7 @@ download_one() {
     fi
 
     echo "Downloading $file"
-    echo "from https://huggingface.co/$REPO"
+    echo "from $HF_ENDPOINT/$REPO"
     echo "If the download stops, run the same command again to resume it."
 
     if [ -n "$TOKEN" ]; then
