@@ -35,6 +35,7 @@ typedef struct {
     bool dump_tokens;
     const char *dump_logprobs_path;
     int dump_logprobs_top_k;
+    const char *dump_logits_path;
     const char *perplexity_file_path;
     const char *imatrix_dataset_path;
     const char *imatrix_output_path;
@@ -296,7 +297,10 @@ typedef struct {
 static void cli_prefill_progress_cb(void *ud, const char *event, int current, int total) {
     (void)total;
     cli_prefill_progress *p = ud;
-    if (!p || !event || strcmp(event, "prefill_chunk") || p->input_tokens <= 0) return;
+    if (!p || !event || p->input_tokens <= 0) return;
+    const bool is_display = strcmp(event, "prefill_display") == 0;
+    if (strcmp(event, "prefill_chunk") && !is_display) return;
+    if (is_display && !p->use_color) return;
 
     int processed = current - p->base_tokens;
     if (processed < 0) processed = 0;
@@ -489,13 +493,18 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
 
     const double t_prefill0 = cli_now_sec();
     ds4_session_set_progress(session, cli_prefill_progress_cb, &progress);
+    ds4_session_set_display_progress(session,
+                                     progress.use_color ? cli_prefill_progress_cb : NULL,
+                                     progress.use_color ? &progress : NULL);
     if (ds4_session_sync(session, prompt, err, sizeof(err)) != 0) {
         ds4_session_set_progress(session, NULL, NULL);
+        ds4_session_set_display_progress(session, NULL, NULL);
         fprintf(stderr, "ds4: prompt processing failed: %s\n", err);
         ds4_session_free(session);
         return 1;
     }
     ds4_session_set_progress(session, NULL, NULL);
+    ds4_session_set_display_progress(session, NULL, NULL);
     const double t_prefill1 = cli_now_sec();
 
     int max_tokens = cfg->gen.n_predict;
@@ -638,6 +647,90 @@ static void json_write_token(FILE *fp, ds4_engine *engine, int token) {
     free(text);
 }
 
+static int run_logits_dump(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
+    ds4_session *session = NULL;
+    if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
+        fprintf(stderr, "ds4: --dump-logits requires a graph session backend\n");
+        return 1;
+    }
+
+    char err[160];
+    cli_prefill_progress progress = {
+        .base_tokens = 0,
+        .input_tokens = prompt->len,
+        .use_color = ds4_log_is_tty(stderr),
+    };
+    ds4_session_set_progress(session, cli_prefill_progress_cb, &progress);
+    ds4_session_set_display_progress(session,
+                                     progress.use_color ? cli_prefill_progress_cb : NULL,
+                                     progress.use_color ? &progress : NULL);
+    if (ds4_session_sync(session, prompt, err, sizeof(err)) != 0) {
+        ds4_session_set_progress(session, NULL, NULL);
+        ds4_session_set_display_progress(session, NULL, NULL);
+        fprintf(stderr, "ds4: prompt processing failed: %s\n", err);
+        ds4_session_free(session);
+        return 1;
+    }
+    ds4_session_set_progress(session, NULL, NULL);
+    ds4_session_set_display_progress(session, NULL, NULL);
+
+    const int vocab = ds4_engine_vocab_size(engine);
+    float *logits = malloc((size_t)vocab * sizeof(logits[0]));
+    if (!logits) {
+        ds4_session_free(session);
+        return 1;
+    }
+    if (ds4_session_copy_logits(session, logits, vocab) != vocab) {
+        fprintf(stderr, "ds4: failed to copy session logits\n");
+        free(logits);
+        ds4_session_free(session);
+        return 1;
+    }
+
+    FILE *fp = fopen(cfg->gen.dump_logits_path, "wb");
+    if (!fp) {
+        fprintf(stderr, "ds4: failed to open --dump-logits file: %s\n", cfg->gen.dump_logits_path);
+        free(logits);
+        ds4_session_free(session);
+        return 1;
+    }
+
+    fprintf(fp, "{\n  \"source\":\"ds4\",\n  \"model\":");
+    json_write_string(fp, cfg->engine.model_path, strlen(cfg->engine.model_path));
+    fprintf(fp,
+            ",\n  \"backend\":\"%s\",\n  \"quant_bits\":%d,\n"
+            "  \"prompt_tokens\":%d,\n  \"ctx\":%d,\n  \"vocab\":%d,\n",
+            ds4_backend_name(cfg->engine.backend),
+            ds4_engine_routed_quant_bits(engine),
+            prompt->len,
+            cfg->gen.ctx_size,
+            vocab);
+    const int argmax = ds4_session_argmax(session);
+    fputs("  \"argmax_token\":", fp);
+    json_write_token(fp, engine, argmax);
+    fprintf(fp, ",\n  \"argmax_logit\":%.9g,\n  \"logits\":[", logits[argmax]);
+    for (int i = 0; i < vocab; i++) {
+        if (i) fputc(',', fp);
+        if ((i % 8) == 0) fputs("\n    ", fp);
+        if (isfinite(logits[i])) {
+            fprintf(fp, "%.9g", logits[i]);
+        } else {
+            fputs("null", fp);
+        }
+    }
+    fputs("\n  ]\n}\n", fp);
+    if (fclose(fp) != 0) {
+        fprintf(stderr, "ds4: failed to close --dump-logits file: %s\n", cfg->gen.dump_logits_path);
+        free(logits);
+        ds4_session_free(session);
+        return 1;
+    }
+
+    free(logits);
+    ds4_session_free(session);
+    return 0;
+}
+
 static int run_logprob_dump(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
@@ -652,13 +745,18 @@ static int run_logprob_dump(ds4_engine *engine, const cli_config *cfg, const ds4
         .use_color = ds4_log_is_tty(stderr),
     };
     ds4_session_set_progress(session, cli_prefill_progress_cb, &progress);
+    ds4_session_set_display_progress(session,
+                                     progress.use_color ? cli_prefill_progress_cb : NULL,
+                                     progress.use_color ? &progress : NULL);
     if (ds4_session_sync(session, prompt, err, sizeof(err)) != 0) {
         ds4_session_set_progress(session, NULL, NULL);
+        ds4_session_set_display_progress(session, NULL, NULL);
         fprintf(stderr, "ds4: prompt processing failed: %s\n", err);
         ds4_session_free(session);
         return 1;
     }
     ds4_session_set_progress(session, NULL, NULL);
+    ds4_session_set_display_progress(session, NULL, NULL);
 
     FILE *fp = fopen(cfg->gen.dump_logprobs_path, "wb");
     if (!fp) {
@@ -1016,13 +1114,18 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
     };
     const double t_prefill0 = cli_now_sec();
     ds4_session_set_progress(chat->session, cli_prefill_progress_cb, &progress);
+    ds4_session_set_display_progress(chat->session,
+                                     progress.use_color ? cli_prefill_progress_cb : NULL,
+                                     progress.use_color ? &progress : NULL);
     if (ds4_session_sync(chat->session, &chat->transcript, err, sizeof(err)) != 0) {
         ds4_session_set_progress(chat->session, NULL, NULL);
+        ds4_session_set_display_progress(chat->session, NULL, NULL);
         chat->transcript.len = rollback_len;
         fprintf(stderr, "ds4: prompt processing failed: %s\n", err);
         return 1;
     }
     ds4_session_set_progress(chat->session, NULL, NULL);
+    ds4_session_set_display_progress(chat->session, NULL, NULL);
     const double t_prefill1 = cli_now_sec();
 
     token_printer printer = {
@@ -1440,14 +1543,15 @@ int main(int argc, char **argv) {
         free(cfg.prompt_owned);
         return rc;
     }
-    if (!cfg.inspect) {
-        log_context_memory(cfg.engine.backend, cfg.gen.ctx_size);
-        cli_warn_think_max_downgraded(&cfg.gen, "--think-max");
-    }
+    cfg.engine.inspect_only = cfg.inspect;
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &cfg.engine) != 0) {
         free(cfg.prompt_owned);
         return 1;
+    }
+    if (!cfg.inspect) {
+        log_context_memory(cfg.engine.backend, cfg.gen.ctx_size);
+        cli_warn_think_max_downgraded(&cfg.gen, "--think-max");
     }
     int rc = 0;
     if (cfg.inspect) {

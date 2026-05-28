@@ -72,6 +72,7 @@ typedef struct {
     const char *expert_mask_file;
     bool warm_weights;
     bool quality;
+    bool inspect_only;
 } ds4_engine_options;
 
 typedef void (*ds4_token_emit_fn)(void *ud, int token);
@@ -96,12 +97,22 @@ typedef struct {
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt);
 void ds4_engine_close(ds4_engine *e);
 void ds4_engine_summary(ds4_engine *e);
+int ds4_engine_vocab_size(ds4_engine *e);
+int ds4_engine_power(ds4_engine *e);
+int ds4_engine_set_power(ds4_engine *e, int power_percent);
+const char *ds4_engine_model_name(ds4_engine *e);
+/* Stable id for cache compatibility.  0 is the original Flash shape, so old
+ * KV files with the previously-zero reserved byte remain Flash-compatible;
+ * Pro and later shapes must use nonzero ids. */
+int ds4_engine_model_id(ds4_engine *e);
 const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 const char *ds4_think_mode_name(ds4_think_mode mode);
 const char *ds4_think_max_prefix(void);
 uint32_t ds4_think_max_min_context(void);
 ds4_think_mode ds4_think_mode_for_context(ds4_think_mode mode, int ctx_size);
+/* Uses the active model shape selected by ds4_engine_open(); call after opening
+ * the GGUF so Flash/Pro dimensions are known. */
 ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size);
 bool ds4_log_is_tty(FILE *fp);
 void ds4_log(FILE *fp, ds4_log_type type, const char *fmt, ...);
@@ -152,6 +163,7 @@ int ds4_token_assistant(ds4_engine *e);
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size);
 void ds4_session_free(ds4_session *s);
 void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud);
+void ds4_session_set_display_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud);
 
 typedef enum {
     DS4_SESSION_REWRITE_ERROR = -1,
@@ -174,6 +186,7 @@ int ds4_session_argmax(ds4_session *s);
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id);
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
+int ds4_session_copy_logits(ds4_session *s, float *out, int cap);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
 int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
