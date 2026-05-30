@@ -1,5 +1,6 @@
 #include "ds4.h"
 #include "ds4_kvstore.h"
+#include "ds4_replica.h"
 #include "rax.h"
 
 /* OpenAI/Anthropic compatible local server.
@@ -7652,7 +7653,41 @@ struct server {
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
+
+    /* M3b' KV offload to replica (path B minimum demo). When kv_offload_fd
+     * is >= 0, the engine may push 608 B/row FP8 attn_comp_kv chunks to the
+     * remote ds4-kv-server for cold-tier storage. All wire writes happen
+     * under kv_offload_mu — the inference worker is single-threaded today,
+     * but guarding keeps us safe if a future client thread issues a push.
+     * Counters are unsynchronized but only the worker mutates them. */
+    int               kv_offload_fd;
+    pthread_mutex_t   kv_offload_mu;
+    uint64_t          kv_offload_seq;
+    uint64_t          kv_offload_puts;
+    uint64_t          kv_offload_push_bytes;
+    uint64_t          kv_offload_rejected;
+    uint64_t          kv_offload_errors;
+    /* Phase 1 wire test: how many rows to push per token per layer (0 disables). */
+    int               kv_offload_rows_per_token;
+    /* Per-layer monotonic row cursor for synthetic pushes. Mirrors what a real
+     * KV cache would do: rows append; we just push the next slice each token.
+     * Wraps modulo a fictional comp_cap so the demo can run indefinitely. */
+    uint32_t          kv_offload_test_row_cursor[64];  /* >= DS4_N_LAYER (43) */
+    /* Synthetic source page (zero-filled, allocated once). */
+    uint8_t          *kv_offload_test_chunk;
+    size_t            kv_offload_test_chunk_bytes;
 };
+
+/* Forward decls for the KV offload helpers — definitions live further down
+ * (next to server_close_resources) but the inference worker loop above needs
+ * to call them per token. */
+static bool server_kv_offload_push(server *s,
+                                   uint32_t layer_idx,
+                                   uint32_t row_start,
+                                   uint32_t row_count,
+                                   uint32_t total_rows,
+                                   const void *fp8_rows);
+static void server_kv_offload_per_token_test_push(server *s);
 
 /* Jobs are stack-owned by the client thread.  The worker signals completion
  * after the response has been written, so request data and the socket remain
@@ -10192,6 +10227,11 @@ static void generate_job(server *s, job *j) {
             ntok = 1;
         }
 
+        /* M3b' Phase 1: per-token wire test. Push synthetic 608 B/row chunks
+         * to the replica simulating real KV offload load. No-op unless
+         * --kv-offload-rows-per-token > 0 and the replica is connected. */
+        server_kv_offload_per_token_test_push(s);
+
         bool stop_decode = false;
         for (int ti = 0; ti < ntok && completion < max_tokens; ti++) {
             token = toks[ti];
@@ -10986,6 +11026,14 @@ typedef struct {
     bool disable_exact_dsml_tool_replay;
     int tool_memory_max_ids;
     bool enable_cors;
+    /* M3b' KV offload (path B). Empty host disables. */
+    const char *kv_offload_host;
+    int         kv_offload_port;
+    /* Phase 1 wire test: per-decoded-token, push this many synthetic 608 B
+     * rows to each layer (zero-filled). 0 disables. At rows=1 the wire sees
+     * the same per-token byte rate as a real KV offload would, without
+     * requiring engine-side FP8 encode or Metal blit-read. */
+    int         kv_offload_rows_per_token;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -11038,11 +11086,167 @@ static void log_context_memory(ds4_backend backend, int ctx_size) {
                m.comp_cap);
 }
 
+/* ----- KV offload (path B, M3b' demo) ------------------------------------
+ *
+ * Connects ds4-server to a remote ds4-kv-server over TCP (Thunderbolt direct).
+ * The remote stores 608 B/row FP8 attn_comp_kv chunks; the host streams rows
+ * out as they age past a configurable threshold (Phase 2, ds4.c side). For
+ * Phase 1 the connection + handshake is established at startup and a push
+ * helper is exposed so the engine can call into it once the bitmap trigger
+ * lands. Connection failures are not fatal — the server logs and continues
+ * with offload disabled, so a misconfigured replica never breaks inference.
+ */
+static bool server_kv_offload_open(server *s, const char *host, int port) {
+    s->kv_offload_fd = -1;
+    if (!host || !host[0] || port <= 0 || port > 65535) return false;
+
+    int fd = ds4_replica_connect(host, (uint16_t)port, 10000);
+    if (fd < 0) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: --kv-offload connect %s:%d failed: %s "
+                   "(continuing without offload)",
+                   host, port, strerror(errno));
+        return false;
+    }
+
+    ds4_replica_handshake self, peer;
+    ds4_replica_self_describe(&self, DS4_REPLICA_ROLE_HOST);
+    if (!ds4_replica_do_handshake(fd, &self, &peer, 10000)) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: --kv-offload handshake with %s:%d failed: %s "
+                   "(continuing without offload)",
+                   host, port, strerror(errno));
+        ds4_replica_close(fd);
+        return false;
+    }
+    if (peer.kv_row_bytes != DS4_REPLICA_KV_ROW_BYTES) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: --kv-offload row_bytes mismatch: peer=%u local=%u "
+                   "(continuing without offload)",
+                   peer.kv_row_bytes, DS4_REPLICA_KV_ROW_BYTES);
+        ds4_replica_close(fd);
+        return false;
+    }
+
+    pthread_mutex_init(&s->kv_offload_mu, NULL);
+    s->kv_offload_fd = fd;
+    s->kv_offload_seq = 0;
+    /* Allocate a synthetic source page large enough for any reasonable
+     * --kv-offload-rows-per-token. 16 rows per call is plenty for the demo;
+     * higher N still works, we just send the same page repeatedly. */
+    s->kv_offload_test_chunk_bytes = (size_t)16 * DS4_REPLICA_KV_ROW_BYTES;
+    s->kv_offload_test_chunk = xmalloc(s->kv_offload_test_chunk_bytes);
+    memset(s->kv_offload_test_chunk, 0, s->kv_offload_test_chunk_bytes);
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: KV offload online -> %s:%d (peer host=%s ver=%s n_layer=%u row_bytes=%u)",
+               host, port, peer.hostname, peer.ds4_version, peer.n_layer, peer.kv_row_bytes);
+    return true;
+}
+
+static void server_kv_offload_close(server *s) {
+    if (s->kv_offload_fd < 0) return;
+    /* Best-effort BYE — replica is happy to time out if we crashed. */
+    (void)ds4_replica_send_msg(s->kv_offload_fd, DS4_REPLICA_MSG_BYE, 0,
+                               ++s->kv_offload_seq, NULL, 0);
+    ds4_replica_close(s->kv_offload_fd);
+    s->kv_offload_fd = -1;
+    pthread_mutex_destroy(&s->kv_offload_mu);
+    free(s->kv_offload_test_chunk);
+    s->kv_offload_test_chunk = NULL;
+    s->kv_offload_test_chunk_bytes = 0;
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: KV offload session done: puts=%llu push=%.2f MiB rej=%llu err=%llu",
+               (unsigned long long)s->kv_offload_puts,
+               (double)s->kv_offload_push_bytes / (1024.0 * 1024.0),
+               (unsigned long long)s->kv_offload_rejected,
+               (unsigned long long)s->kv_offload_errors);
+}
+
+/* Phase 1 wire-test push: synthesize one push per layer (configurable rows)
+ * for the just-generated token. Called from the worker decode loop. */
+static void server_kv_offload_per_token_test_push(server *s) {
+    if (s->kv_offload_fd < 0 || s->kv_offload_rows_per_token <= 0) return;
+    /* DS4 V4 Flash is fixed at 43 layers. Hard-coded to avoid plumbing
+     * ds4_engine_n_layer through the public header just for a demo flag. */
+    const uint32_t n_layer = 43;
+    /* Fictional comp_cap large enough to look like a 1M-context cache; rows
+     * wrap to keep the demo running forever without running off the end. */
+    const uint32_t synth_comp_cap = 262144u;
+    uint32_t rows = (uint32_t)s->kv_offload_rows_per_token;
+    if (rows * (uint32_t)DS4_REPLICA_KV_ROW_BYTES > s->kv_offload_test_chunk_bytes) {
+        rows = (uint32_t)(s->kv_offload_test_chunk_bytes / DS4_REPLICA_KV_ROW_BYTES);
+    }
+    if (rows == 0) return;
+    for (uint32_t il = 0; il < n_layer && il < 64; il++) {
+        uint32_t cursor = s->kv_offload_test_row_cursor[il];
+        if (cursor + rows > synth_comp_cap) cursor = 0;
+        (void)server_kv_offload_push(s, il, cursor, rows, synth_comp_cap,
+                                     s->kv_offload_test_chunk);
+        s->kv_offload_test_row_cursor[il] = cursor + rows;
+    }
+}
+
+/* Push row_count rows of FP8 attn_comp_kv (608 B each, layer-major) to the
+ * replica. Returns true on success. Caller already serialized writes to its
+ * own KV cache; we add another mutex because future client threads (eviction
+ * worker, snapshot persistence) may want to push concurrently. */
+static bool server_kv_offload_push(server *s,
+                                   uint32_t layer_idx,
+                                   uint32_t row_start,
+                                   uint32_t row_count,
+                                   uint32_t total_rows,
+                                   const void *fp8_rows) {
+    if (s->kv_offload_fd < 0 || row_count == 0) return false;
+
+    pthread_mutex_lock(&s->kv_offload_mu);
+    uint64_t seq = ++s->kv_offload_seq;
+    bool ok = ds4_replica_kv_stream_send(s->kv_offload_fd, seq,
+                                         layer_idx, row_start, row_count,
+                                         total_rows, fp8_rows);
+    if (ok) {
+        s->kv_offload_puts++;
+        s->kv_offload_push_bytes += (uint64_t)row_count * DS4_REPLICA_KV_ROW_BYTES;
+        /* Reaper for HANDOVER_ACK responses to PUTs that the replica rejects
+         * (out-of-budget). We poll non-blocking so the hot path never stalls;
+         * any pending ACK is drained, counted, and the next push proceeds.
+         * If the replica genuinely closed, the next send fails and we log. */
+        struct pollfd pfd = { .fd = s->kv_offload_fd, .events = POLLIN };
+        while (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
+            ds4_replica_wire_header wh;
+            if (!ds4_replica_recv_header(s->kv_offload_fd, &wh, 100)) {
+                s->kv_offload_errors++;
+                break;
+            }
+            if (wh.msg_type == DS4_REPLICA_MSG_KV_HANDOVER_ACK) {
+                if (wh.flags & 1u) s->kv_offload_rejected++;
+            } else if (wh.payload_bytes) {
+                /* Drain unknown payload to keep the stream framed. */
+                uint8_t scratch[4096];
+                uint32_t left = wh.payload_bytes;
+                while (left) {
+                    size_t n = left < sizeof(scratch) ? left : sizeof(scratch);
+                    if (!ds4_replica_recv_payload(s->kv_offload_fd, scratch, n, 1000)) {
+                        s->kv_offload_errors++;
+                        break;
+                    }
+                    left -= (uint32_t)n;
+                }
+            }
+            pfd.revents = 0;
+        }
+    } else {
+        s->kv_offload_errors++;
+    }
+    pthread_mutex_unlock(&s->kv_offload_mu);
+    return ok;
+}
+
 static void server_close_resources(server *s) {
     if (s->trace) {
         fclose(s->trace);
         s->trace = NULL;
     }
+    server_kv_offload_close(s);
     kv_cache_close(&s->kv);
     tool_memory_free(&s->tool_mem);
     live_tool_state_free(&s->responses_live);
@@ -11067,6 +11271,9 @@ static void usage(FILE *fp) {
         "      GGUF model path. Default: ds4flash.gguf\n"
         "  --mtp FILE\n"
         "      Optional MTP support GGUF used for draft-token probes.\n"
+        "  --mtp-remote HOST:PORT\n"
+        "      Run the MTP drafter off-host on a ds4-mtp-replica reached at\n"
+        "      HOST:PORT (mutually exclusive with --mtp). Use --mtp-draft >1.\n"
         "  --mtp-draft N\n"
         "      Maximum autoregressive MTP draft tokens per speculative step. Default: 1\n"
         "  --mtp-margin F\n"
@@ -11132,6 +11339,16 @@ static void usage(FILE *fp) {
         "  --tool-memory-max-ids N\n"
         "      Maximum exact tool-call IDs kept in RAM for replay. Default: 100000\n"
         "\n"
+        "Dual-host KV offload (path B, M3b' demo):\n"
+        "  --kv-offload HOST:PORT\n"
+        "      Stream cold-tier FP8 attn_comp_kv rows to a remote ds4-kv-server.\n"
+        "      Replica must be running ds4-kv-server on the named address. Connection\n"
+        "      failure is non-fatal; the server logs and runs without offload.\n"
+        "  --kv-offload-rows-per-token N\n"
+        "      Phase 1 wire test only. After each generated token, push N synthetic\n"
+        "      608 B/row chunks per layer (43 layers in V4 Flash). N=1 simulates the\n"
+        "      wire load of a real per-token KV offload. 0 disables. Default: 0\n"
+        "\n"
         "  Cache triggers:\n"
         "      cold       save a stable prefix of a long first prompt before generation starts\n"
         "      continued  save absolute aligned restart frontiers during long prefill or generation\n"
@@ -11195,6 +11412,8 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--mtp-remote")) {
+            c.engine.mtp_remote = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {
             c.engine.mtp_draft_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-margin")) {
@@ -11235,6 +11454,24 @@ static server_config parse_options(int argc, char **argv) {
             c.disable_exact_dsml_tool_replay = true;
         } else if (!strcmp(arg, "--tool-memory-max-ids")) {
             c.tool_memory_max_ids = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--kv-offload-rows-per-token")) {
+            c.kv_offload_rows_per_token = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--kv-offload")) {
+            /* Format: HOST:PORT. The replica must be running ds4-kv-server.
+             * We split on the last ':' so IPv6 literals in brackets still parse. */
+            const char *spec = need_arg(&i, argc, argv, arg);
+            const char *colon = strrchr(spec, ':');
+            if (!colon || colon == spec || !colon[1]) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --kv-offload expects HOST:PORT, got %s", spec);
+                exit(2);
+            }
+            size_t hlen = (size_t)(colon - spec);
+            char *h = xmalloc(hlen + 1);
+            memcpy(h, spec, hlen);
+            h[hlen] = '\0';
+            c.kv_offload_host = h;
+            c.kv_offload_port = parse_int_arg(colon + 1, "--kv-offload port");
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
         } else if (!strcmp(arg, "--dir-steering-file")) {
@@ -11312,9 +11549,14 @@ int main(int argc, char **argv) {
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
+    s.kv_offload_fd = -1;
+    s.kv_offload_rows_per_token = cfg.kv_offload_rows_per_token;
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
+    }
+    if (cfg.kv_offload_host && cfg.kv_offload_port > 0) {
+        (void)server_kv_offload_open(&s, cfg.kv_offload_host, cfg.kv_offload_port);
     }
     if (s.disable_exact_dsml_tool_replay) {
         server_log(DS4_LOG_DEFAULT,

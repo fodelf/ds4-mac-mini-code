@@ -35,6 +35,7 @@
 #include <unistd.h>
 
 #include "ds4.h"
+#include "ds4_replica.h"
 
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
@@ -15217,6 +15218,19 @@ struct ds4_engine {
     bool quality;
     bool metal_ready;
     bool mtp_ready;
+    /* Off-host MTP drafter (path B).  When mtp_remote is set, the local MTP
+     * model is NOT loaded; the drafter runs on a second machine reached over
+     * the ds4-replica wire protocol.  remote_mtp_fd is the connected socket. */
+    char *mtp_remote;
+    int remote_mtp_fd;
+    bool remote_mtp_ready;
+    /* Path B routed-expert cold tier: connected socket to a ds4-expert-replica.
+     * The Metal expert-cache miss path pulls experts through here via the fetch
+     * callback (ds4_gpu_set_expert_fetch_callback). */
+    char *expert_remote;
+    int remote_expert_fd;
+    bool remote_expert_ready;
+    uint64_t expert_seq;
 };
 
 static bool cpu_directional_steering_enabled(
@@ -16651,6 +16665,18 @@ struct ds4_session {
     float *logits;
     float *mtp_logits;
     int mtp_draft_token;
+    /* Replica-side MTP drafting: the raw-cache row count at the start of the
+     * current draft burst.  The next request carries prev_accepted so we can
+     * roll the SWA cache back to mtp_burst_base_raw + accepted before redrafting
+     * (mirror of the host's DS4_MTP_KEEP_ACCEPTED, applied across the wire). */
+    uint32_t mtp_burst_base_raw;
+    /* Host-side remote MTP: drafts cached from the last burst, accepted count
+     * to fold into the next request, and a reusable hc seed staging buffer. */
+    int mtp_remote_drafts[16];
+    int mtp_remote_n;
+    int mtp_remote_prev_accepted;
+    uint64_t mtp_remote_seq;
+    float *mtp_remote_hc;
     uint64_t mtp_probe_total;
     uint64_t mtp_probe_hit;
     ds4_session_progress_fn progress;
@@ -16933,11 +16959,48 @@ int ds4_engine_routed_quant_bits(ds4_engine *e) {
 }
 
 bool ds4_engine_has_mtp(ds4_engine *e) {
-    return e && e->backend != DS4_BACKEND_CPU && e->mtp_ready;
+    return e && e->backend != DS4_BACKEND_CPU && (e->mtp_ready || e->remote_mtp_ready);
+}
+
+/* Expert-server support (routed cold tier, path B).  Expose the base GGUF mmap
+ * + per-layer routed-expert mmap offsets so ds4-expert-replica can gather raw
+ * expert bytes for a host over the wire.  Per-expert bytes = tensor bytes /
+ * n_expert (gate and up share the gate size; down has its own).  The replica
+ * opens the engine with backend=CPU so only the model is mapped (no graph,
+ * no inference) — serving is pure CPU memcpy from the mmap. */
+const void *ds4_engine_model_map_ptr(ds4_engine *e, uint64_t *size_out) {
+    if (!e) return NULL;
+    if (size_out) *size_out = e->model.size;
+    return e->model.map;
+}
+
+int ds4_engine_expert_layout(ds4_engine *e, uint32_t *n_layer, uint32_t *n_expert,
+                             uint64_t *gate_expert_bytes, uint64_t *down_expert_bytes) {
+    if (!e) return 1;
+    const ds4_tensor *gate = e->weights.layer[0].ffn_gate_exps;
+    const ds4_tensor *down = e->weights.layer[0].ffn_down_exps;
+    if (!gate || !down || DS4_N_EXPERT == 0) return 1;
+    if (n_layer) *n_layer = DS4_N_LAYER;
+    if (n_expert) *n_expert = DS4_N_EXPERT;
+    if (gate_expert_bytes) *gate_expert_bytes = gate->bytes / DS4_N_EXPERT;
+    if (down_expert_bytes) *down_expert_bytes = down->bytes / DS4_N_EXPERT;
+    return 0;
+}
+
+int ds4_engine_expert_offsets(ds4_engine *e, uint32_t layer,
+                              uint64_t *gate_off, uint64_t *up_off, uint64_t *down_off) {
+    if (!e || layer >= DS4_N_LAYER) return 1;
+    const ds4_layer_weights *l = &e->weights.layer[layer];
+    if (!l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) return 1;
+    if (gate_off) *gate_off = l->ffn_gate_exps->abs_offset;
+    if (up_off)   *up_off   = l->ffn_up_exps->abs_offset;
+    if (down_off) *down_off = l->ffn_down_exps->abs_offset;
+    return 0;
 }
 
 int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
-    return e && e->backend != DS4_BACKEND_CPU && e->mtp_ready ? e->mtp_draft_tokens : 0;
+    if (!e || e->backend == DS4_BACKEND_CPU) return 0;
+    return (e->mtp_ready || e->remote_mtp_ready) ? e->mtp_draft_tokens : 0;
 }
 
 const ds4_tokens *ds4_session_tokens(ds4_session *s) {
@@ -18113,12 +18176,132 @@ int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
     return 0;
 }
 
+/* Connect to a ds4-mtp-replica and handshake.  endpoint is "host:port"
+ * (rightmost ':' splits, so bracketless IPv6 literals are not supported — same
+ * convention as the server's --kv-offload).  Returns the socket fd or -1. */
+static int ds4_connect_remote_mtp(const char *endpoint) {
+    const char *colon = strrchr(endpoint, ':');
+    if (!colon || colon == endpoint || !colon[1]) {
+        fprintf(stderr, "ds4: --mtp-remote needs host:port (got '%s')\n", endpoint);
+        return -1;
+    }
+    size_t hlen = (size_t)(colon - endpoint);
+    char host[256];
+    if (hlen >= sizeof(host)) hlen = sizeof(host) - 1;
+    memcpy(host, endpoint, hlen);
+    host[hlen] = '\0';
+    int port = atoi(colon + 1);
+    if (port <= 0 || port > 65535) {
+        fprintf(stderr, "ds4: --mtp-remote bad port in '%s'\n", endpoint);
+        return -1;
+    }
+    int fd = ds4_replica_connect(host, (uint16_t)port, 10000);
+    if (fd < 0) {
+        fprintf(stderr, "ds4: --mtp-remote connect to %s:%d failed: %s\n",
+                host, port, strerror(errno));
+        return -1;
+    }
+    ds4_replica_handshake self, peer;
+    ds4_replica_self_describe(&self, DS4_REPLICA_ROLE_HOST);
+    if (!ds4_replica_do_handshake(fd, &self, &peer, 10000)) {
+        fprintf(stderr, "ds4: --mtp-remote handshake with %s:%d failed\n", host, port);
+        ds4_replica_close(fd);
+        return -1;
+    }
+    if (peer.role != DS4_REPLICA_ROLE_MTP_REPLICA) {
+        fprintf(stderr, "ds4: --mtp-remote peer %s:%d is not an MTP replica (role=%u)\n",
+                host, port, peer.role);
+        ds4_replica_close(fd);
+        return -1;
+    }
+    fprintf(stderr, "ds4: off-host MTP drafter connected: %s:%d (peer=%s)\n",
+            host, port, peer.hostname);
+    return fd;
+}
+
+/* Connect to a ds4-expert-replica (path B routed-expert cold tier) and
+ * handshake.  Same host:port convention as --mtp-remote.  Returns fd or -1. */
+static int ds4_connect_remote_expert(const char *endpoint) {
+    const char *colon = strrchr(endpoint, ':');
+    if (!colon || colon == endpoint || !colon[1]) {
+        fprintf(stderr, "ds4: --expert-remote needs host:port (got '%s')\n", endpoint);
+        return -1;
+    }
+    size_t hlen = (size_t)(colon - endpoint);
+    char host[256];
+    if (hlen >= sizeof(host)) hlen = sizeof(host) - 1;
+    memcpy(host, endpoint, hlen);
+    host[hlen] = '\0';
+    int port = atoi(colon + 1);
+    if (port <= 0 || port > 65535) {
+        fprintf(stderr, "ds4: --expert-remote bad port in '%s'\n", endpoint);
+        return -1;
+    }
+    int fd = ds4_replica_connect(host, (uint16_t)port, 10000);
+    if (fd < 0) {
+        fprintf(stderr, "ds4: --expert-remote connect to %s:%d failed: %s\n",
+                host, port, strerror(errno));
+        return -1;
+    }
+    ds4_replica_handshake self, peer;
+    ds4_replica_self_describe(&self, DS4_REPLICA_ROLE_HOST);
+    if (!ds4_replica_do_handshake(fd, &self, &peer, 10000)) {
+        fprintf(stderr, "ds4: --expert-remote handshake with %s:%d failed\n", host, port);
+        ds4_replica_close(fd);
+        return -1;
+    }
+    if (peer.role != DS4_REPLICA_ROLE_REPLICA) {
+        fprintf(stderr, "ds4: --expert-remote peer %s:%d is not an expert replica (role=%u)\n",
+                host, port, peer.role);
+        ds4_replica_close(fd);
+        return -1;
+    }
+    fprintf(stderr, "ds4: off-host expert tier connected: %s:%d (peer=%s)\n",
+            host, port, peer.hostname);
+    return fd;
+}
+
+#ifndef DS4_NO_GPU
+/* Fetch callback for the Metal expert-cache miss path (registered via
+ * ds4_gpu_set_expert_fetch_callback).  One batched EXPERT_REQ per decode layer:
+ * ship the missed expert ids, drain the gate||up||down blocks into out_blocks.
+ * Returns 1 on success, 0 so the caller falls back to the local mmap. */
+static int ds4_host_expert_fetch(void *ud, uint32_t layer, uint32_t n,
+                                 const uint32_t *ids, void *out_blocks,
+                                 uint64_t gate_expert_bytes, uint64_t down_expert_bytes) {
+    ds4_engine *e = (ds4_engine *)ud;
+    if (!e || e->remote_expert_fd < 0 || n == 0 || n > 32) return 0;
+    int32_t id32[32];
+    for (uint32_t k = 0; k < n; k++) id32[k] = (int32_t)ids[k];
+    const uint64_t seq = e->expert_seq++;
+    if (!ds4_replica_send_expert_req(e->remote_expert_fd, seq, layer, n, id32,
+                                     (uint32_t)gate_expert_bytes, (uint32_t)down_expert_bytes)) {
+        return 0;
+    }
+    ds4_replica_expert_resp_hdr rh;
+    const size_t total = (size_t)n * (2u * gate_expert_bytes + down_expert_bytes);
+    if (!ds4_replica_recv_expert_resp(e->remote_expert_fd, &rh, out_blocks, total, 30000)) {
+        return 0;
+    }
+    if (rh.status != 0 || rh.n_ids != n) return 0;
+    return 1;
+}
+#endif
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
     e->model.fd = -1;
     e->mtp_model.fd = -1;
+    e->remote_mtp_fd = -1;
+    e->remote_expert_fd = -1;
     e->backend = opt->backend;
     e->quality = opt->quality;
+    if (opt->mtp_remote && opt->mtp_remote[0]) {
+        e->mtp_remote = ds4_strdup(opt->mtp_remote);
+    }
+    if (opt->expert_remote && opt->expert_remote[0]) {
+        e->expert_remote = ds4_strdup(opt->expert_remote);
+    }
     e->mtp_draft_tokens = opt->mtp_draft_tokens > 0 ? opt->mtp_draft_tokens : 1;
     if (e->mtp_draft_tokens > 16) e->mtp_draft_tokens = 16;
     e->mtp_margin = opt->mtp_margin >= 0.0f ? opt->mtp_margin : 3.0f;
@@ -18142,7 +18325,12 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     ds4_acquire_instance_lock();
 
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
-    model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
+    /* expert_server_mode opens lazily: the expert server serves targeted
+     * memcpy'd experts, so it must NOT trigger the full-model WILLNEED prefetch
+     * that model_prefetch_cpu_mapping() does for CPU *inference* — that prefetch
+     * pulls the whole ~82 GiB mapping into the page cache and OOMs the host. */
+    const bool prefetch_cpu = !opt->inspect_only && !opt->expert_server_mode;
+    model_open(&e->model, opt->model_path, graph_backend, prefetch_cpu);
     if (opt->warm_weights) model_warm_weights(&e->model);
     if (!opt->inspect_only) vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);
@@ -18161,7 +18349,13 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         *out = NULL;
         return 1;
     }
-    if (opt->mtp_path && opt->mtp_path[0]) {
+    if (e->mtp_remote && opt->mtp_path && opt->mtp_path[0]) {
+        fprintf(stderr, "ds4: --mtp and --mtp-remote are mutually exclusive\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
+    if (!e->mtp_remote && opt->mtp_path && opt->mtp_path[0]) {
         model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
         mtp_weights_bind(&e->mtp_weights, &e->mtp_model);
         e->mtp_ready = true;
@@ -18226,7 +18420,16 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             }
         }
         (void)ds4_gpu_set_model_fd(e->model.fd);
-        if (!ds4_gpu_set_model_map_range(e->model.map,
+        /* In MTP replica mode we deliberately do NOT create model views over
+         * the 82 GiB base GGUF.  The replica only reads two tensors from base
+         * (token_embd + output) and pins them as resident MTLBuffers below;
+         * creating 79 view MTLBuffers over the 82 GiB mmap leaves the IOGPU
+         * able to wire any of them (~2 GiB each) during draft, which is the
+         * memory blow-up the user observed.  Skipping the view creation means
+         * the base file occupies only VM address space (no physical pages
+         * unless explicitly read), and only the resident pins consume RAM. */
+        if (!opt->mtp_replica_mode &&
+            !ds4_gpu_set_model_map_range(e->model.map,
                                            e->model.size,
                                            e->model.tensor_data_pos,
                                            e->model.size - e->model.tensor_data_pos,
@@ -18240,12 +18443,47 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
+        uint64_t mtp_effective_max_tensor = e->mtp_model.max_tensor_bytes;
+        if (e->mtp_ready && opt->mtp_replica_mode) {
+            /* Pin every MTP tensor above PIN_THRESHOLD as resident.  Each pinned
+             * tensor becomes a dedicated MTLBuffer that bypasses model-view
+             * binding entirely.  After pinning, the remaining (small) MTP
+             * tensors fit in a tight 256 MiB view cap, so per-CB wired memory
+             * during draft is bounded by (pinned size, always wired) +
+             * (small_view × few_bindings) instead of (multi-GiB views). */
+            const uint64_t PIN_THRESHOLD = (uint64_t)256 * 1024 * 1024;
+            uint64_t max_unpinned = 0;
+            int pin_failed = 0;
+            for (uint64_t i = 0; i < e->mtp_model.n_tensors && !pin_failed; i++) {
+                const ds4_tensor *t = &e->mtp_model.tensors[i];
+                if (t->bytes > PIN_THRESHOLD) {
+                    if (!ds4_gpu_register_mtp_resident_range(e->mtp_model.map,
+                                                              e->mtp_model.size,
+                                                              t->abs_offset, t->bytes))
+                    {
+                        /* Out of pin slots; fall back to original behavior so
+                         * map still succeeds (peak just won't be reduced). */
+                        max_unpinned = e->mtp_model.max_tensor_bytes;
+                        pin_failed = 1;
+                    }
+                } else if (t->bytes > max_unpinned) {
+                    max_unpinned = t->bytes;
+                }
+            }
+            mtp_effective_max_tensor = max_unpinned;
+            const uint64_t page = (uint64_t)16 * 1024;
+            uint64_t cap = max_unpinned + page * 2;
+            cap = (cap + page - 1) & ~(page - 1);
+            const uint64_t cap_floor = (uint64_t)256 * 1024 * 1024;
+            if (cap < cap_floor) cap = cap_floor;
+            ds4_gpu_set_view_cap_next_call(cap);
+        }
         if (e->mtp_ready &&
             !ds4_gpu_set_model_map_range(e->mtp_model.map,
                                            e->mtp_model.size,
                                            e->mtp_model.tensor_data_pos,
                                            e->mtp_model.size - e->mtp_model.tensor_data_pos,
-                                           e->mtp_model.max_tensor_bytes))
+                                           mtp_effective_max_tensor))
         {
             fprintf(stderr,
                     "ds4: %s failed to map MTP model views; aborting startup. "
@@ -18255,6 +18493,67 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
+        if (e->mtp_ready && opt->mtp_replica_mode) {
+            /* Replica only needs token_embd + output from the 82 GiB base GGUF.
+             * Pin those into resident MTLBuffers (memcpy faults ~1.5 GiB of
+             * mmap pages once), then release the rest with MADV_DONTNEED so
+             * the kernel evicts ALL base file-cache pages.  Net physical RAM
+             * cost for base: zero — only the resident MTLBuffer remains.
+             * The base mmap stays as VM mapping so the resident-range registry
+             * keeps a valid model_map pointer for wrap_model_range lookups. */
+            if (!ds4_gpu_register_mtp_resident_range(e->model.map, e->model.size,
+                                                      e->weights.token_embd->abs_offset,
+                                                      e->weights.token_embd->bytes) ||
+                !ds4_gpu_register_mtp_resident_range(e->model.map, e->model.size,
+                                                      e->weights.output->abs_offset,
+                                                      e->weights.output->bytes))
+            {
+                fprintf(stderr, "ds4: failed to pin MTP resident tensors; aborting startup\n");
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            /* Evict every file-cache page the resident memcpys (and earlier
+             * metadata parsing) faulted in.  Subsequent GPU draft never reads
+             * through e->model.map — all base accesses route to the resident
+             * MTLBuffers — so the kernel never refaults these pages. */
+            /* No madvise: with noCopy resident MTLBuffers, no memcpy ran, so no
+             * source pages were faulted that need releasing.  Pages fault only
+             * when the GPU binds a buffer to a CB and can be reclaimed between
+             * bursts.  MADV_FREE here would mark our noCopy-wrapped pages as
+             * discardable, which could corrupt tensor data on next bind. */
+        }
+#ifndef DS4_NO_GPU
+        /* Dense residency (DS4_DENSE_RESIDENT): pin every non-routed weight into
+         * a resident RAM pool so decode reads them from RAM instead of
+         * re-faulting the dominant ~3 GiB/token of dense weights from SSD.
+         * Routed experts (ffn_*_exps, 72 GiB) stay mmap-backed.  token_embd is
+         * excluded (only 1 row read/token); output is kept (full read/token). */
+        {
+            const char *dr_env = getenv("DS4_DENSE_RESIDENT");
+            if (!e->mtp_ready && dr_env && dr_env[0] && dr_env[0] != '0') {
+                uint64_t *offs = xmalloc((size_t)e->model.n_tensors * sizeof(uint64_t));
+                uint64_t *lens = xmalloc((size_t)e->model.n_tensors * sizeof(uint64_t));
+                uint32_t n_dense = 0;
+                for (uint64_t i = 0; i < e->model.n_tensors; i++) {
+                    const ds4_tensor *t = &e->model.tensors[i];
+                    if (t->bytes == 0) continue;
+                    if (memmem(t->name.ptr, t->name.len, "exps", 4) != NULL) continue;
+                    if (ds4_streq(t->name, "token_embd.weight")) continue;
+                    offs[n_dense] = t->abs_offset;
+                    lens[n_dense] = t->bytes;
+                    n_dense++;
+                }
+                if (n_dense > 0 &&
+                    !ds4_gpu_build_dense_resident_pool(e->model.map, e->model.size,
+                                                       offs, lens, n_dense)) {
+                    fprintf(stderr, "ds4: dense resident pool build failed; using mmap views\n");
+                }
+                free(offs);
+                free(lens);
+            }
+        }
+#endif
         if (!e->mtp_ready && !accelerator_cache_model_tensors(e->backend, &e->model)) {
             fprintf(stderr, "ds4: %s failed to prepare startup model cache\n",
                     ds4_backend_name(e->backend));
@@ -18272,6 +18571,39 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         ds4_engine_close(e);
         *out = NULL;
         return 1;
+    }
+#endif
+
+    if (e->mtp_remote) {
+        if (e->backend == DS4_BACKEND_CPU) {
+            fprintf(stderr, "ds4: --mtp-remote requires a graph backend (not CPU)\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        e->remote_mtp_fd = ds4_connect_remote_mtp(e->mtp_remote);
+        if (e->remote_mtp_fd < 0) {
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        e->remote_mtp_ready = true;
+    }
+
+#ifndef DS4_NO_GPU
+    /* Path B routed-expert cold tier: connect the expert replica and register
+     * the Metal fetch callback so decode cache misses pull over the wire. */
+    if (e->expert_remote && e->backend != DS4_BACKEND_CPU) {
+        e->remote_expert_fd = ds4_connect_remote_expert(e->expert_remote);
+        if (e->remote_expert_fd < 0) {
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        e->remote_expert_ready = true;
+        ds4_gpu_set_expert_fetch_callback(ds4_host_expert_fetch, e);
+        fprintf(stderr, "ds4: routed-expert cache misses will pull from %s over the wire\n",
+                e->expert_remote);
     }
 #endif
 
@@ -18311,6 +18643,19 @@ int ds4_engine_model_id(ds4_engine *e) {
 
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
+    if (e->remote_mtp_fd >= 0) {
+        /* Best-effort BYE so the replica logs a clean session end. */
+        (void)ds4_replica_send_msg(e->remote_mtp_fd, DS4_REPLICA_MSG_BYE, 0, 0, NULL, 0);
+        ds4_replica_close(e->remote_mtp_fd);
+        e->remote_mtp_fd = -1;
+    }
+    if (e->remote_expert_fd >= 0) {
+        (void)ds4_replica_send_msg(e->remote_expert_fd, DS4_REPLICA_MSG_BYE, 0, 0, NULL, 0);
+        ds4_replica_close(e->remote_expert_fd);
+        e->remote_expert_fd = -1;
+    }
+    free(e->mtp_remote);
+    free(e->expert_remote);
     weights_free(&e->weights);
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
@@ -18352,7 +18697,10 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->prefill_cap = metal_graph_prefill_cap_for_prompt(ctx_size);
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, s->prefill_cap);
     if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, &e->weights.layer[0],
-                                   raw_cap, (uint32_t)ctx_size, s->prefill_cap, e->mtp_ready))
+                                   raw_cap, (uint32_t)ctx_size, s->prefill_cap,
+                                   /* remote MTP also needs the verify buffers (spec_logits / batch_cur_hc):
+                                    * host verifies the off-host drafts with the target model. */
+                                   e->mtp_ready || e->remote_mtp_ready))
     {
         free(s);
         return 1;
@@ -18369,6 +18717,11 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
     if (e->mtp_ready) {
         s->mtp_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->mtp_logits[0]));
+        s->mtp_draft_token = -1;
+    }
+    if (e->remote_mtp_ready) {
+        /* Staging buffer for the cur_hc seed shipped to the off-host drafter. */
+        s->mtp_remote_hc = xmalloc((size_t)DS4_N_HC * DS4_N_EMBD * sizeof(float));
         s->mtp_draft_token = -1;
     }
     *out = s;
@@ -18390,6 +18743,7 @@ void ds4_session_free(ds4_session *s) {
     token_vec_free(&s->checkpoint);
     free(s->logits);
     free(s->mtp_logits);
+    free(s->mtp_remote_hc);
     free(s);
 }
 
@@ -18814,6 +19168,143 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
     return ds4_session_eval_internal(s, token, true, err, errlen);
 }
 
+/* Off-host MTP drafting (replica side).
+ *
+ * The host runs the target model and ships its just-committed cur_hc here; this
+ * function reseeds the MTP drafter from that state and runs draft_cap recursive
+ * steps, exactly as the local speculative path does, but standalone.  The MTP
+ * SWA raw cache persists across bursts: prev_accepted from the previous burst
+ * rolls the cache back to the accepted frontier before drafting (the wire
+ * equivalent of DS4_MTP_KEEP_ACCEPTED).  Returns the number of draft tokens
+ * produced (>=0), or -1 on error. */
+int ds4_engine_mtp_draft_burst(ds4_session *s,
+                               const float *seed_hc, int hc_floats,
+                               int seed_token, uint32_t seed_pos,
+                               int draft_cap, int prev_accepted, int eos_token,
+                               int *out_drafts, int out_cap,
+                               char *err, size_t errlen) {
+#ifdef DS4_NO_GPU
+    (void)s; (void)seed_hc; (void)hc_floats; (void)seed_token; (void)seed_pos;
+    (void)draft_cap; (void)prev_accepted; (void)eos_token; (void)out_drafts; (void)out_cap;
+    snprintf(err, errlen, "GPU support is not compiled in");
+    return -1;
+#else
+    if (!s || !seed_hc || !out_drafts || out_cap <= 0 || draft_cap <= 0) {
+        snprintf(err, errlen, "invalid mtp draft args");
+        return -1;
+    }
+    ds4_engine *e = s->engine;
+    if (!e->mtp_ready) { snprintf(err, errlen, "mtp model not loaded"); return -1; }
+    const int hc_expect = (int)(DS4_N_HC * DS4_N_EMBD);
+    if (hc_floats != hc_expect) {
+        snprintf(err, errlen, "hc shape mismatch: got %d want %d", hc_floats, hc_expect);
+        return -1;
+    }
+    if (draft_cap > out_cap) draft_cap = out_cap;
+    if (draft_cap > 16) draft_cap = 16;  /* mtp_state/next_hc ping-pong; spec_logits cap */
+
+    /* Roll the SWA raw cache back to base + accepted from the previous burst. */
+    uint32_t keep = s->mtp_burst_base_raw + (uint32_t)(prev_accepted < 0 ? 0 : prev_accepted);
+    if (keep > s->graph.raw_window) keep = s->graph.raw_window;
+    s->graph.mtp_n_raw = keep;
+    s->mtp_burst_base_raw = keep;
+
+    /* Seed: upload the host's cur_hc into the first ping-pong slot. */
+    const uint64_t hc_bytes = (uint64_t)hc_expect * sizeof(float);
+    if (ds4_gpu_tensor_write(s->graph.mtp_state_hc, 0, seed_hc, hc_bytes) == 0) {
+        snprintf(err, errlen, "mtp seed upload failed");
+        return -1;
+    }
+
+    int n = 0;
+    for (int i = 0; i < draft_cap; i++) {
+        ds4_gpu_tensor *prev_hc = (i & 1) ? s->graph.mtp_next_hc : s->graph.mtp_state_hc;
+        ds4_gpu_tensor *out_hc  = (i & 1) ? s->graph.mtp_state_hc : s->graph.mtp_next_hc;
+        const int step_token = (i == 0) ? seed_token : out_drafts[i - 1];
+        int mtp_top = -1;
+        if (!metal_graph_eval_mtp_draft_from_hc(&s->graph,
+                                                &e->model, &e->weights,
+                                                &e->mtp_model, &e->mtp_weights,
+                                                prev_hc, out_hc,
+                                                step_token,
+                                                seed_pos + (uint32_t)i,
+                                                NULL, &mtp_top)) {
+            if (n == 0) { snprintf(err, errlen, "mtp draft step failed"); return -1; }
+            break;  /* partial burst is still usable; host verifies what it got */
+        }
+        out_drafts[n++] = mtp_top;
+        if (mtp_top == eos_token) break;
+    }
+    return n;
+#endif
+}
+
+/* Reset the replica MTP raw cache at a generation/session boundary. */
+void ds4_engine_mtp_draft_reset(ds4_session *s) {
+    if (!s) return;
+#ifndef DS4_NO_GPU
+    s->graph.mtp_n_raw = 0;
+#endif
+    s->mtp_burst_base_raw = 0;
+}
+
+int ds4_engine_mtp_hc_floats(ds4_engine *e) {
+    (void)e;
+    return (int)(DS4_N_HC * DS4_N_EMBD);
+}
+
+/* Copy the live target hyper-connection state into a host buffer.  This is the
+ * MTP drafter's seed: after a decode step, g->cur_hc holds the last layer's
+ * hc rows that the local MTP path feeds as prev_hc. */
+int ds4_session_copy_cur_hc(ds4_session *s, float *out, int cap) {
+#ifdef DS4_NO_GPU
+    (void)s; (void)out; (void)cap;
+    return 0;
+#else
+    if (!s || !out) return 0;
+    const int need = (int)(DS4_N_HC * DS4_N_EMBD);
+    if (cap < need || !s->graph.cur_hc) return 0;
+    if (ds4_gpu_tensor_read(s->graph.cur_hc, 0, out,
+                            (uint64_t)need * sizeof(float)) == 0) {
+        return 0;
+    }
+    return need;
+#endif
+}
+
+#ifndef DS4_NO_GPU
+/* Host side of off-host MTP.  Ships the live cur_hc to the drafter replica and
+ * collects up to draft_cap proposed tokens.  prev_accepted (from the previous
+ * burst) rides along so the replica rolls its SWA cache to the accepted
+ * frontier before drafting.  Caches drafts in the session; returns the count
+ * (>=0) or -1 on wire/seed failure (caller falls back to plain decode). */
+static int host_remote_mtp_burst(ds4_session *s, int seed_token,
+                                 int draft_cap, int eos_token) {
+    ds4_engine *e = s->engine;
+    if (e->remote_mtp_fd < 0 || !s->mtp_remote_hc) return -1;
+    const int hc_floats = (int)(DS4_N_HC * DS4_N_EMBD);
+    if (ds4_session_copy_cur_hc(s, s->mtp_remote_hc, hc_floats) != hc_floats) return -1;
+    if (draft_cap > 16) draft_cap = 16;
+    const uint32_t seed_pos = (uint32_t)(s->checkpoint.len - 1);
+    const uint64_t seq = ++s->mtp_remote_seq;
+    if (!ds4_replica_send_mtp_req(e->remote_mtp_fd, seq, seed_token, seed_pos,
+                                  (uint32_t)hc_floats, (uint32_t)draft_cap,
+                                  (uint32_t)s->mtp_remote_prev_accepted,
+                                  (uint32_t)eos_token, s->mtp_remote_hc)) {
+        return -1;
+    }
+    ds4_replica_mtp_resp_hdr rh;
+    int32_t out[16];
+    if (!ds4_replica_recv_mtp_resp(e->remote_mtp_fd, &rh, out, 16, 30000)) return -1;
+    if (rh.status != 0) return -1;
+    int n = (int)rh.n_draft;
+    if (n > 16) n = 16;
+    for (int i = 0; i < n; i++) s->mtp_remote_drafts[i] = out[i];
+    s->mtp_remote_n = n;
+    return n;
+}
+#endif
+
 /* Speculative decode state machine:
  * 1. commit the normal target token and use its logits to validate draft[0];
  * 2. let MTP recursively draft a tiny suffix from its own raw-cache frontier;
@@ -18855,7 +19346,25 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     accepted[n_accept++] = first_token;
     if (first_token == eos_token || max_tokens == 1 || n_accept >= accepted_cap) return n_accept;
 
-    if (!e->mtp_ready || !s->mtp_draft_valid || e->mtp_draft_tokens <= 1) return n_accept;
+    /* Off-host MTP: produce this cycle's drafts on the replica.  The cached
+     * drafts then feed the same verifier as the local path; the recursion loop
+     * below reads s->mtp_remote_drafts instead of running the local MTP graph. */
+    if (e->remote_mtp_ready) {
+#ifdef DS4_NO_GPU
+        return n_accept;
+#else
+        if (e->mtp_draft_tokens <= 1) return n_accept;
+        int n = host_remote_mtp_burst(s, first_token, e->mtp_draft_tokens, eos_token);
+        if (n <= 0) { s->mtp_remote_prev_accepted = 0; return n_accept; }
+        s->mtp_draft_token = s->mtp_remote_drafts[0];
+        s->mtp_draft_valid = true;
+        /* Default to "nothing accepted beyond the seed" until a commit path
+         * records otherwise; this is the prev_accepted for the next burst. */
+        s->mtp_remote_prev_accepted = 0;
+#endif
+    } else if (!e->mtp_ready || !s->mtp_draft_valid || e->mtp_draft_tokens <= 1) {
+        return n_accept;
+    }
 
     int draft_cap = e->mtp_draft_tokens;
     if (draft_cap > max_tokens - n_accept) draft_cap = max_tokens - n_accept;
@@ -18869,18 +19378,23 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     drafts[0] = s->mtp_draft_token;
     s->mtp_draft_valid = false;
     const bool strict_mtp = e->quality || getenv("DS4_MTP_STRICT") != NULL;
-    float mtp_margin_threshold = e->mtp_margin;
+    /* The off-host drafter returns token ids only — no per-step MTP logits — so
+     * the margin/confidence features that inspect mtp_logits are unavailable
+     * (s->mtp_logits is NULL for a remote-only host).  Force them off and let
+     * the batched target verifier alone decide the accepted prefix. */
+    float mtp_margin_threshold = e->remote_mtp_ready ? 0.0f : e->mtp_margin;
     const char *mtp_margin_env = getenv("DS4_MTP_MIN_MARGIN");
     if (mtp_margin_env && mtp_margin_env[0]) {
         char *end = NULL;
         float v = strtof(mtp_margin_env, &end);
-        if (end != mtp_margin_env && v >= 0.0f) mtp_margin_threshold = v;
+        if (end != mtp_margin_env && v >= 0.0f && !e->remote_mtp_ready) mtp_margin_threshold = v;
     }
     const bool mtp_timing = getenv("DS4_MTP_TIMING") != NULL;
-    const bool mtp_conf_log = getenv("DS4_MTP_CONF_LOG") != NULL;
-    const bool mtp_need_logits = mtp_conf_log ||
-        getenv("DS4_MTP_FULL_LOGITS") != NULL ||
-        (!strict_mtp && mtp_margin_threshold > 0.0f);
+    const bool mtp_conf_log = getenv("DS4_MTP_CONF_LOG") != NULL && !e->remote_mtp_ready;
+    const bool mtp_need_logits = !e->remote_mtp_ready &&
+        (mtp_conf_log ||
+         getenv("DS4_MTP_FULL_LOGITS") != NULL ||
+         (!strict_mtp && mtp_margin_threshold > 0.0f));
     const double mtp_t0 = mtp_timing ? now_sec() : 0.0;
     double mtp_t_after_draft = mtp_t0;
     float mtp_last_margin = 0.0f;
@@ -18906,16 +19420,31 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
      * must become invisible.  We do not copy/rollback the cache body because the
      * next draft attempt will overwrite future slots.  A counter is enough.
      */
+/* Record the accepted-draft count.  Locally this rolls the MTP SWA cache to
+ * base+accepted; with a remote drafter the replica owns that cache, so we stash
+ * the count to fold into the next burst request as prev_accepted. */
 #define DS4_MTP_KEEP_ACCEPTED(n_) do { \
-        uint32_t keep_ = mtp_base_raw + (uint32_t)(n_); \
-        if (keep_ > s->graph.raw_window) keep_ = s->graph.raw_window; \
-        s->graph.mtp_n_raw = keep_; \
+        if (e->remote_mtp_ready) { \
+            s->mtp_remote_prev_accepted = (int)(n_); \
+        } else { \
+            uint32_t keep_ = mtp_base_raw + (uint32_t)(n_); \
+            if (keep_ > s->graph.raw_window) keep_ = s->graph.raw_window; \
+            s->graph.mtp_n_raw = keep_; \
+        } \
     } while (0)
 
     for (; draft_n < draft_cap; draft_n++) {
+        int mtp_top = -1;
+        if (e->remote_mtp_ready) {
+            /* Drafts were produced in one burst; just consume the cache. */
+            if (draft_n >= s->mtp_remote_n) break;
+            mtp_top = s->mtp_remote_drafts[draft_n];
+            drafts[draft_n] = mtp_top;
+            if (drafts[draft_n] == eos_token) { draft_n++; break; }
+            continue;
+        }
         ds4_gpu_tensor *prev_hc = (draft_n & 1) ? s->graph.mtp_state_hc : s->graph.mtp_next_hc;
         ds4_gpu_tensor *out_hc = (draft_n & 1) ? s->graph.mtp_next_hc : s->graph.mtp_state_hc;
-        int mtp_top = -1;
         if (!metal_graph_eval_mtp_draft_from_hc(&s->graph,
                                                 &e->model,
                                                 &e->weights,

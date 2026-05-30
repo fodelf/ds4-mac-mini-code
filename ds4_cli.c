@@ -88,6 +88,13 @@ static void usage(FILE *fp) {
         "      GGUF model path. Default: ds4flash.gguf\n"
         "  --mtp FILE\n"
         "      Optional MTP support GGUF used for draft-token probes.\n"
+        "  --mtp-remote HOST:PORT\n"
+        "      Run the MTP drafter off-host on a ds4-mtp-replica at HOST:PORT\n"
+        "      (mutually exclusive with --mtp; use --mtp-draft >1).\n"
+        "  --expert-remote HOST:PORT\n"
+        "      Pull routed-expert cache misses from a ds4-expert-replica at\n"
+        "      HOST:PORT over Thunderbolt instead of the local SSD (path B cold\n"
+        "      tier; pair with DS4_DENSE_RESIDENT=1 + DS4_EXPERT_CACHE_BYTES).\n"
         "  --mtp-draft N\n"
         "      Maximum autoregressive MTP draft tokens per speculative step. Default: 1\n"
         "  --mtp-margin F\n"
@@ -1419,6 +1426,10 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--mtp-remote")) {
+            c.engine.mtp_remote = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--expert-remote")) {
+            c.engine.expert_remote = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {
             c.engine.mtp_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-margin")) {

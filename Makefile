@@ -16,8 +16,10 @@ METAL_SRCS := $(wildcard metal/*.metal)
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
-CORE_OBJS = ds4.o ds4_metal.o
-CPU_CORE_OBJS = ds4_cpu.o
+# ds4.o calls the ds4-replica wire protocol (off-host MTP), so ds4_replica.o is
+# part of the engine core and every engine binary links it.
+CORE_OBJS = ds4.o ds4_metal.o ds4_replica.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_replica.o
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= /usr/local/cuda
@@ -28,20 +30,22 @@ NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
-CORE_OBJS = ds4.o ds4_cuda.o
-CPU_CORE_OBJS = ds4_cpu.o
+CORE_OBJS = ds4.o ds4_cuda.o ds4_replica.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_replica.o
 METAL_LDLIBS := $(LDLIBS)
 endif
 
 .PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression
 
 ifeq ($(UNAME_S),Darwin)
-all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
+all: ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4-replica ds4-kv-server ds4-mtp-replica ds4-expert-replica
 
 help:
 	@echo "DS4 build targets:"
-	@echo "  make              Build Metal ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
+	@echo "  make              Build Metal ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, ./ds4-agent, ./ds4-replica, and ./ds4-kv-server"
 	@echo "  make cpu          Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
+	@echo "  make ds4-replica  Build dual-host wire-protocol driver (no engine link)"
+	@echo "  make ds4-kv-server Build replica-side slim KV byte store (no engine, no Metal, no GGUF)"
 	@echo "  make test         Build and run tests"
 	@echo "  make clean        Remove build outputs"
 
@@ -59,6 +63,21 @@ ds4-eval: ds4_eval.o $(CORE_OBJS)
 
 ds4-agent: ds4_agent.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ ds4_agent.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS) $(METAL_LDLIBS)
+
+ds4-replica: ds4_replica_main.o ds4_replica.o
+	$(CC) $(CFLAGS) -o $@ ds4_replica_main.o ds4_replica.o $(LDLIBS)
+
+ds4-kv-server: ds4_kv_server.o ds4_replica.o
+	$(CC) $(CFLAGS) -o $@ ds4_kv_server.o ds4_replica.o $(LDLIBS)
+
+# Off-host MTP drafter: full engine (loads base + MTP GGUF) + wire protocol.
+ds4-mtp-replica: ds4_mtp_replica_main.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ ds4_mtp_replica_main.o $(CORE_OBJS) $(METAL_LDLIBS)
+
+# Off-host routed-expert cold tier: loads base GGUF (CPU backend, mmap only),
+# serves routed-expert bytes to a host over the wire protocol.
+ds4-expert-replica: ds4_expert_replica_main.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ ds4_expert_replica_main.o $(CORE_OBJS) $(METAL_LDLIBS)
 
 cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu.o ds4_web.o ds4_kvstore.o linenoise.o rax.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
@@ -110,9 +129,9 @@ ds4-eval: ds4_eval.o $(CORE_OBJS)
 ds4-agent: ds4_agent.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu.o ds4_web.o ds4_kvstore.o linenoise.o rax.o $(CPU_CORE_OBJS)
+cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu.o ds4_web.o ds4_kvstore.o ds4_replica.o linenoise.o rax.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
-	$(CC) $(CFLAGS) -o ds4-server ds4_server_cpu.o ds4_kvstore.o rax.o $(CPU_CORE_OBJS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o ds4-server ds4_server_cpu.o ds4_kvstore.o ds4_replica.o rax.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-bench ds4_bench_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-eval ds4_eval_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-agent ds4_agent_cpu.o ds4_web.o ds4_kvstore.o linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
@@ -141,6 +160,18 @@ ds4_agent.o: ds4_agent.c ds4.h ds4_kvstore.h ds4_web.h linenoise.h
 
 ds4_web.o: ds4_web.c ds4_web.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_web.c
+
+ds4_replica.o: ds4_replica.c ds4_replica.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_replica.c
+
+ds4_replica_main.o: ds4_replica_main.c ds4_replica.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_replica_main.c
+
+ds4_kv_server.o: ds4_kv_server.c ds4_replica.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_kv_server.c
+
+ds4_mtp_replica_main.o: ds4_mtp_replica_main.c ds4.h ds4_replica.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_mtp_replica_main.c
 
 ds4_kvstore.o: ds4_kvstore.c ds4_kvstore.h ds4.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_kvstore.c
@@ -195,4 +226,4 @@ test: ds4_test
 	./ds4_test
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4-replica ds4-kv-server ds4-mtp-replica ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

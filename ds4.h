@@ -62,6 +62,10 @@ typedef void (*ds4_session_progress_fn)(void *ud, const char *event, int current
 typedef struct {
     const char *model_path;
     const char *mtp_path;
+    /* Off-host MTP drafter endpoint "host:port".  Mutually exclusive with a
+     * local mtp_path: when set, the engine connects to a ds4-mtp-replica
+     * instead of loading the MTP support model locally. */
+    const char *mtp_remote;
     ds4_backend backend;
     int n_threads;
     int mtp_draft_tokens;
@@ -73,6 +77,23 @@ typedef struct {
     bool warm_weights;
     bool quality;
     bool inspect_only;
+    /* When true, engine_open copies token_embd and output tensors from the base
+     * GGUF into resident Metal buffers so IOGPU wires only the tensor bytes
+     * (~2.66 GiB) instead of two full 2 GiB model-view MTLBuffers on every
+     * MTP draft step.  Set by ds4-mtp-replica. */
+    bool mtp_replica_mode;
+    /* When set ("host:port"), the engine connects to a ds4-expert-replica and
+     * pulls routed-expert cache misses over the wire (path B cold tier) instead
+     * of re-faulting them from the local SSD.  Independent of --mtp-remote. */
+    const char *expert_remote;
+    /* Set by ds4-expert-replica: open the GGUF for *targeted, lazy* expert reads
+     * only — no graph, no inference, and crucially NO full-model WILLNEED
+     * prefetch.  A plain CPU-backend open calls model_prefetch_cpu_mapping(),
+     * which posix_madvise(WILLNEED)s the entire ~82 GiB mapping; the kernel
+     * readahead then floods the page cache and OOMs a 16 GiB host faster than
+     * any userspace watchdog can react.  The expert server never streams the
+     * whole model — it must fault only the experts it actually serves. */
+    bool expert_server_mode;
 } ds4_engine_options;
 
 typedef void (*ds4_token_emit_fn)(void *ud, int token);
@@ -193,12 +214,38 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen);
+
+/* Off-host MTP drafting (replica side).  Reseeds the MTP drafter from the
+ * host's cur_hc and runs up to draft_cap recursive steps, returning proposed
+ * token ids.  prev_accepted rolls the SWA raw cache back to the accepted
+ * frontier of the previous burst.  Returns drafts produced (>=0) or -1. */
+int ds4_engine_mtp_draft_burst(ds4_session *s,
+                               const float *seed_hc, int hc_floats,
+                               int seed_token, uint32_t seed_pos,
+                               int draft_cap, int prev_accepted, int eos_token,
+                               int *out_drafts, int out_cap,
+                               char *err, size_t errlen);
+void ds4_engine_mtp_draft_reset(ds4_session *s);
+/* hc row width (n_hc * n_embd floats) for sizing the wire transfer. */
+int ds4_engine_mtp_hc_floats(ds4_engine *e);
+/* Read the live target hyper-connection state (cur_hc) after a decode step into
+ * a host buffer of ds4_engine_mtp_hc_floats() floats.  Returns floats copied. */
+int ds4_session_copy_cur_hc(ds4_session *s, float *out, int cap);
 void ds4_session_invalidate(ds4_session *s);
 void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);
 int ds4_engine_routed_quant_bits(ds4_engine *e);
 bool ds4_engine_has_mtp(ds4_engine *e);
+
+/* Expert-server support (routed cold tier, path B): expose the base GGUF mmap +
+ * per-layer routed-expert offsets so ds4-expert-replica can serve raw expert
+ * bytes.  Open the engine with backend=CPU (model mapped, no graph/inference). */
+const void *ds4_engine_model_map_ptr(ds4_engine *e, uint64_t *size_out);
+int ds4_engine_expert_layout(ds4_engine *e, uint32_t *n_layer, uint32_t *n_expert,
+                             uint64_t *gate_expert_bytes, uint64_t *down_expert_bytes);
+int ds4_engine_expert_offsets(ds4_engine *e, uint32_t layer,
+                              uint64_t *gate_off, uint64_t *up_off, uint64_t *down_off);
 int ds4_engine_mtp_draft_tokens(ds4_engine *e);
 const ds4_tokens *ds4_session_tokens(ds4_session *s);
 

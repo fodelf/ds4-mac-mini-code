@@ -39,6 +39,31 @@ int ds4_gpu_synchronize(void);
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
+/* MTP replica: copy tensor bytes into a resident MTLBuffer so IOGPU only wires
+ * the tensor data rather than the full 2 GiB model-view MTLBuffer containing it.
+ * Must be called after ds4_gpu_set_model_map_range; released by ds4_gpu_cleanup. */
+int  ds4_gpu_register_mtp_resident_range(const void *model_map, uint64_t model_size, uint64_t orig_offset, uint64_t bytes);
+void ds4_gpu_clear_mtp_resident_ranges(void);
+/* Pin a list of (offset,len) tensor ranges into one resident RAM buffer so
+ * wrap_model_range returns RAM, not mmap views.  Used for dense (non-routed)
+ * weights so decode stops page-faulting them.  Gated by the caller (engine-open
+ * checks DS4_DENSE_RESIDENT).  Returns 1 on success, 0 to fall back to mmap. */
+int  ds4_gpu_build_dense_resident_pool(const void *model_map, uint64_t model_size,
+                                       const uint64_t *offsets, const uint64_t *lens, uint32_t n);
+
+/* Routed-expert remote fetch callback (path B cold tier).  Invoked on a decode
+ * expert-cache miss with the layer + missed expert ids; must fill out_blocks
+ * with n * (2*gate_expert_bytes + down_expert_bytes) bytes — gate||up||down per
+ * id, in id order.  Return 1 on success, 0 to fall back to the local mmap.
+ * Set by the engine when --expert-remote is connected (NULL = local only). */
+typedef int (*ds4_expert_fetch_fn)(void *ud, uint32_t layer, uint32_t n,
+                                   const uint32_t *ids, void *out_blocks,
+                                   uint64_t gate_expert_bytes, uint64_t down_expert_bytes);
+void ds4_gpu_set_expert_fetch_callback(ds4_expert_fetch_fn fn, void *ud);
+/* One-shot per-view cap override for the NEXT set_model_map_range call.
+ * 0 = no override.  Replica uses this to give the MTP map a tight 256 MiB cap
+ * so each CB wires only KiB-MiB of MTP, not 2-6 GiB worth of views. */
+void ds4_gpu_set_view_cap_next_call(uint64_t bytes);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes);

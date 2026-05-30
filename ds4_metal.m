@@ -62,6 +62,14 @@ static uint64_t g_diag_decode_a3_gpu_wait_ns;
 static uint64_t g_diag_decode_a3_cpu_memcpy_ns;
 static uint64_t g_diag_decode_a3_cb_open_ns;
 static uint32_t g_diag_decode_a3_layer_count;
+/* Persistent expert-cache per-decode-token accumulators (see the cache block
+ * near ds4_gpu_expert_cache_lookup_or_fill).  Reset/printed alongside the A3
+ * counters above; only the SSD-faulting misses' bytes land in pagein. */
+static uint64_t g_diag_cache_hits;
+static uint64_t g_diag_cache_misses;
+static uint64_t g_diag_cache_evicts;
+static uint64_t g_diag_cache_pagein_bytes;   /* miss bytes served from local mmap (SSD) */
+static uint64_t g_diag_cache_remote;         /* miss experts served from the remote tier (TB) */
 static mach_timebase_info_data_t g_diag_timebase;
 static int g_diag_timebase_initialized;
 static id<MTLComputePipelineState> g_set_rows_f32_i32_pipeline;
@@ -187,6 +195,89 @@ static id<MTLBuffer> g_attn_out_group_ids_buffer;
 static id<MTLBuffer> g_moe_scratch_gate;
 static id<MTLBuffer> g_moe_scratch_up;
 static id<MTLBuffer> g_moe_scratch_down;
+/*
+ * Cross-token persistent compact LRU expert cache (decode only).  The A3
+ * scratch above is one-layer-sized and refilled every layer, so each decode
+ * token re-memcpys 6 experts/layer from the GGUF mmap — cold pages fault from
+ * SSD, ~4.8 GiB/token (execution-log: 12 s/token thrash).  This cache instead
+ * pins the hottest experts in N_SLOTS compact slots that survive across tokens:
+ * a hit reuses the resident bytes (no memcpy, no fault); only a miss memcpys
+ * one expert from mmap (the sole SSD-faulting path).  Layout is slot*expert_bytes
+ * (gate/up share gate_expert_bytes, down uses down_expert_bytes) so the matmul
+ * kernels index it exactly like the full tensor with ne02=n_slots.  Decode
+ * routes in the raw 256-id space; g_expert_cache_map maps (layer,expert_id) to a
+ * slot and ds4_gpu_expert_cache_lookup_or_fill emits compact slot ids into
+ * g_moe_selected_compact_buffer.  Allocated lazily on first decode, freed in
+ * shutdown.  Gated by DS4_EXPERT_CACHE_BYTES/SLOTS on top of EXPERT_OFFLOAD.
+ */
+static id<MTLBuffer> g_expert_cache_gate;
+static id<MTLBuffer> g_expert_cache_up;
+static id<MTLBuffer> g_expert_cache_down;
+static NSUInteger     g_expert_cache_gate_bytes;
+static NSUInteger     g_expert_cache_up_bytes;
+static NSUInteger     g_expert_cache_down_bytes;
+static int32_t       *g_expert_cache_map;        /* [n_layer*n_expert], slot or -1 */
+static int32_t       *g_expert_cache_slot_owner; /* [n_slots], layer*n_expert+id or -1 */
+static uint64_t      *g_expert_cache_lru;        /* [n_slots], last-touch clock */
+static uint64_t       g_expert_cache_clock;
+static uint32_t       g_expert_cache_n_slots;
+static uint32_t       g_expert_cache_map_entries; /* n_layer*n_expert, for free/reset */
+/* Optional remote routed-expert tier (path B): on a cache miss the host pulls
+ * the layer's missed experts over TB instead of its local SSD.  Set by the
+ * engine when --expert-remote is connected; NULL = local mmap fallback. */
+static ds4_expert_fetch_fn g_expert_fetch_cb;
+static void               *g_expert_fetch_ud;
+static void               *g_expert_fetch_buf;     /* contiguous gather buffer for one layer's misses */
+static size_t              g_expert_fetch_buf_bytes;
+/*
+ * MTP replica resident-tensor registry.  On a replica the base model's
+ * token_embd and output tensors live at the two extremes of the 81 GiB GGUF,
+ * so they fall in different 2 GiB model-view MTLBuffers.  IOGPU wires the
+ * whole MTLBuffer whenever any byte of it is bound to a command buffer, so
+ * accessing just those two tensors already wires ~4 GiB of base model views.
+ * With DS4_METAL_NO_RESIDENCY those 4 GiB are re-faulted from SSD on every
+ * draft step.  This registry short-circuits wrap_model_range: if the requested
+ * range is covered by a resident copy, return the small resident MTLBuffer
+ * (inner_offset relative to the copy) instead of the 2 GiB view.  The GPU
+ * then wires only the copy (~2.66 GiB total for both tensors) once.
+ * Registered once at engine-open time via ds4_gpu_register_mtp_resident_range;
+ * released in ds4_gpu_cleanup.
+ */
+typedef struct {
+    const void   *model_map;
+    uint64_t      model_size;
+    uint64_t      orig_offset;        /* GGUF tensor's absolute offset */
+    uint64_t      bytes;              /* tensor byte count */
+    uint64_t      aligned_offset;     /* page-aligned base for the noCopy buffer */
+    id<MTLBuffer> buffer;             /* noCopy wrapper on [aligned_offset, aligned_offset+aligned_bytes) */
+} ds4_mtp_resident_range;
+#define DS4_MTP_RESIDENT_MAX 16
+static ds4_mtp_resident_range g_mtp_resident[DS4_MTP_RESIDENT_MAX];
+static int g_mtp_resident_count = 0;
+
+/*
+ * Dense resident pool.  Unlike the MTP noCopy registry above, this is a REAL
+ * RAM allocation (newBufferWithLength) holding packed copies of every non-routed
+ * weight (attn, indexer, shared expert, norms, router) — ~6.5 GiB.  decode reads
+ * dense weights every token (100% reuse), so pinning them in RAM eliminates the
+ * dominant ~3 GiB/token SSD page-fault (routed experts, 72 GiB, stay mmap-backed
+ * and are handled by the expert cache).  wrap_model_range binary-searches the
+ * sorted range table and returns the pool instead of the mmap view for any dense
+ * tensor.  Built once at engine-open, gated by DS4_DENSE_RESIDENT.
+ */
+typedef struct { uint64_t orig_offset; uint64_t bytes; uint64_t pool_offset; } ds4_dense_range;
+static id<MTLBuffer>    g_dense_pool;
+static NSUInteger       g_dense_pool_bytes;
+static const void      *g_dense_model_map;
+static uint64_t         g_dense_model_size;
+static ds4_dense_range *g_dense_ranges;     /* sorted by orig_offset */
+static uint32_t         g_dense_range_count;
+
+/* One-shot override for the next set_model_map_range call's per-view cap.
+ * Set just before mapping the MTP file on a replica so its views are small
+ * (256 MiB rather than 2 GiB) — each CB then wires KiB-MiB of MTP rather
+ * than ~6 GiB across 3 huge views.  Cleared automatically after use. */
+static uint64_t g_view_cap_next_call = 0;
 static const void *g_model_map_ptr;
 static uint64_t g_model_map_size;
 static uint64_t g_model_mapped_offset;
@@ -247,7 +338,7 @@ static void ds4_gpu_print_device_summary(void) {
     }
 }
 
-#define DS4_METAL_MAX_MODEL_VIEWS 64  /* 64 × 1.25 GiB cap covers 80 GiB; 64 × 2 GiB covers 128 GiB (needed for full 81 GB GGUF with sub-3.5 GiB view-shrink to keep per-CB wireable peak bounded). */
+#define DS4_METAL_MAX_MODEL_VIEWS 128  /* Was 64. That math ignored per-view overlap: step = cap - (max_tensor + page), so a 2 GiB cap on the 81 GB GGUF needs ~80 views (81 / (2 - ~1.06)), not 64 -> map aborted with "needs more mapped views". 128 covers the 2 GiB shrink case; smaller views keep the per-CB wireable peak bounded on a 16 GiB M4. */
 #define DS4_METAL_MODEL_MAX_TENSOR_BYTES 704643072ull
 /* Compatibility fallback for callers that cannot provide a parsed GGUF tensor
  * span. The normal DS4 engine passes the exact maximum tensor byte size. */
@@ -566,6 +657,19 @@ static int ds4_gpu_map_model_views(
             fprintf(stderr,
                     "ds4: ignoring DS4_METAL_MODEL_MAX_VIEW_BYTES=%s (must be >=256 MiB and < device max %llu)\n",
                     env_max_view, (unsigned long long)max_buffer);
+        }
+    }
+    /* One-shot override applied AFTER env: a stricter per-map cap (used by
+     * replica MTP mapping to keep each MTP view small so per-CB wiring is
+     * tightly bounded).  Cleared after consumption. */
+    if (g_view_cap_next_call != 0) {
+        uint64_t cap = g_view_cap_next_call & ~(page - 1);
+        g_view_cap_next_call = 0;
+        if (cap >= (uint64_t)256 * 1024 * 1024 && cap < max_buffer) {
+            fprintf(stderr,
+                    "ds4: Metal model view max bytes further reduced to %.2f GiB by per-map override\n",
+                    (double)cap / (1024.0 * 1024.0 * 1024.0));
+            max_buffer = cap;
         }
     }
     if (max_tensor_bytes > map_size) {
@@ -1241,7 +1345,14 @@ void ds4_gpu_print_memory_report(const char *label) {
         (uint64_t)g_moe_gate_scratch_bytes +
         (uint64_t)g_moe_down_scratch_bytes +
         (uint64_t)g_moe_id_map_bytes +
-        (uint64_t)g_moe_selected_compact_bytes;
+        (uint64_t)g_moe_selected_compact_bytes +
+        (uint64_t)g_moe_scratch_gate_bytes +
+        (uint64_t)g_moe_scratch_up_bytes +
+        (uint64_t)g_moe_scratch_down_bytes +
+        (uint64_t)g_expert_cache_gate_bytes +
+        (uint64_t)g_expert_cache_up_bytes +
+        (uint64_t)g_expert_cache_down_bytes +
+        (uint64_t)g_dense_pool_bytes;
 
     fprintf(stderr, "ds4: Metal memory report%s%s\n",
             label && label[0] ? " " : "",
@@ -1259,6 +1370,11 @@ void ds4_gpu_print_memory_report(const char *label) {
             "ds4:   model residency requests %llu%s\n",
             (unsigned long long)g_model_residency_count,
             getenv("DS4_METAL_NO_RESIDENCY") != NULL ? " (disabled)" : "");
+    if (g_dense_pool_bytes) {
+        fprintf(stderr,
+                "ds4:   dense resident pool %.2f GiB (%u non-routed tensors pinned in RAM)\n",
+                ds4_gpu_gib((uint64_t)g_dense_pool_bytes), g_dense_range_count);
+    }
     fprintf(stderr,
             "ds4:   scratch %.2f MiB (flash mask %.2f, pad %.2f, tmp %.2f, blk %.2f, ring %.2f, kv %.2f, compressor %.2f, router %.2f, indexer %.2f, moe %.2f, f16 %.2f, raw-store %.2f)\n",
             ds4_gpu_mib(scratch),
@@ -1284,7 +1400,13 @@ void ds4_gpu_print_memory_report(const char *label) {
             ds4_gpu_mib((uint64_t)g_moe_gate_scratch_bytes +
                           (uint64_t)g_moe_down_scratch_bytes +
                           (uint64_t)g_moe_id_map_bytes +
-                          (uint64_t)g_moe_selected_compact_bytes),
+                          (uint64_t)g_moe_selected_compact_bytes +
+                          (uint64_t)g_moe_scratch_gate_bytes +
+                          (uint64_t)g_moe_scratch_up_bytes +
+                          (uint64_t)g_moe_scratch_down_bytes +
+                          (uint64_t)g_expert_cache_gate_bytes +
+                          (uint64_t)g_expert_cache_up_bytes +
+                          (uint64_t)g_expert_cache_down_bytes),
             ds4_gpu_mib((uint64_t)g_f16_round_scratch_bytes),
             ds4_gpu_mib((uint64_t)g_raw_store_round_bytes));
 }
@@ -1377,6 +1499,11 @@ void ds4_gpu_diag_decode_token_begin(void) {
     g_diag_decode_a3_cpu_memcpy_ns = 0;
     g_diag_decode_a3_cb_open_ns = 0;
     g_diag_decode_a3_layer_count = 0;
+    g_diag_cache_hits = 0;
+    g_diag_cache_misses = 0;
+    g_diag_cache_evicts = 0;
+    g_diag_cache_pagein_bytes = 0;
+    g_diag_cache_remote = 0;
 }
 
 /* #58 Lvl 2: print the per-decode-token A3 sync-cost summary.  Called by
@@ -1403,6 +1530,29 @@ void ds4_gpu_diag_decode_token_end(int token_pos) {
             (double)g_diag_decode_a3_gpu_wait_ns / per_layer / 1.0e6,
             (double)g_diag_decode_a3_cpu_memcpy_ns / per_layer / 1.0e6,
             (double)g_diag_decode_a3_cb_open_ns / per_layer / 1.0e6);
+
+    /* Persistent expert cache per-token summary: hit rate + the only bytes that
+     * actually fault from SSD (misses).  Occupancy is cumulative across tokens. */
+    const uint64_t cache_total = g_diag_cache_hits + g_diag_cache_misses;
+    if (cache_total > 0) {
+        uint32_t occupied = 0;
+        if (g_expert_cache_slot_owner && g_expert_cache_n_slots > 0) {
+            for (uint32_t s = 0; s < g_expert_cache_n_slots; s++)
+                if (g_expert_cache_slot_owner[s] >= 0) occupied++;
+        }
+        fprintf(stderr,
+                "ds4_diag: decode_token[pos=%d] expert_cache hits=%llu misses=%llu "
+                "hit_rate=%.1f%% evicts=%llu remote=%llu pagein=%.1f MiB occupancy=%u/%u\n",
+                token_pos,
+                (unsigned long long)g_diag_cache_hits,
+                (unsigned long long)g_diag_cache_misses,
+                100.0 * (double)g_diag_cache_hits / (double)cache_total,
+                (unsigned long long)g_diag_cache_evicts,
+                (unsigned long long)g_diag_cache_remote,
+                (double)g_diag_cache_pagein_bytes / 1048576.0,
+                occupied, g_expert_cache_n_slots);
+        ds4_diag_vmstat("post-decode-token");
+    }
 }
 
 void ds4_gpu_set_quality(bool quality) {
@@ -4553,6 +4703,28 @@ void ds4_gpu_cleanup(void) {
         g_moe_scratch_gate_bytes = 0;
         g_moe_scratch_up_bytes = 0;
         g_moe_scratch_down_bytes = 0;
+        g_expert_cache_gate = nil;
+        g_expert_cache_up = nil;
+        g_expert_cache_down = nil;
+        g_expert_cache_gate_bytes = 0;
+        g_expert_cache_up_bytes = 0;
+        g_expert_cache_down_bytes = 0;
+        free(g_expert_cache_map);          g_expert_cache_map = NULL;
+        free(g_expert_cache_slot_owner);   g_expert_cache_slot_owner = NULL;
+        free(g_expert_cache_lru);          g_expert_cache_lru = NULL;
+        g_expert_cache_clock = 0;
+        g_expert_cache_n_slots = 0;
+        g_expert_cache_map_entries = 0;
+        free(g_expert_fetch_buf);          g_expert_fetch_buf = NULL;
+        g_expert_fetch_buf_bytes = 0;
+        g_expert_fetch_cb = NULL;
+        g_expert_fetch_ud = NULL;
+        g_dense_pool = nil;
+        g_dense_pool_bytes = 0;
+        free(g_dense_ranges);              g_dense_ranges = NULL;
+        g_dense_range_count = 0;
+        g_dense_model_map = NULL;
+        g_dense_model_size = 0;
         g_model_map_ptr = NULL;
         g_model_map_size = 0;
         g_model_mapped_offset = 0;
@@ -4588,6 +4760,7 @@ void ds4_gpu_cleanup(void) {
         g_model_wrap_count = 0;
         g_model_wrap_bytes = 0;
         g_model_wrap_max_bytes = 0;
+        ds4_gpu_clear_mtp_resident_ranges();
         ds4_gpu_model_residency_clear();
         ds4_gpu_model_views_clear();
         [g_pipeline_cache removeAllObjects];
@@ -4932,6 +5105,41 @@ static id<MTLBuffer> ds4_gpu_wrap_model_range(
         return nil;
     }
 
+    /* Check resident copies first: token_embd and output for MTP replica path.
+     * The resident buffer is a noCopy wrapper anchored at aligned_offset;
+     * recover the tensor's exact position via (offset - aligned_offset). */
+    for (int r = 0; r < g_mtp_resident_count; r++) {
+        if (g_mtp_resident[r].model_map  != model_map  ||
+            g_mtp_resident[r].model_size != model_size) continue;
+        const uint64_t rs = g_mtp_resident[r].orig_offset;
+        const uint64_t re = rs + g_mtp_resident[r].bytes;
+        if (offset >= rs && (offset + len) <= re) {
+            *inner_offset = offset - g_mtp_resident[r].aligned_offset;
+            return g_mtp_resident[r].buffer;
+        }
+    }
+
+    /* Dense resident pool: binary-search the sorted range table.  A hit means
+     * this is a non-routed weight pinned in RAM — return the pool copy. */
+    if (g_dense_pool && model_map == g_dense_model_map && model_size == g_dense_model_size) {
+        int lo = 0, hi = (int)g_dense_range_count - 1;
+        while (lo <= hi) {
+            const int mid = (lo + hi) >> 1;
+            const ds4_dense_range *dr = &g_dense_ranges[mid];
+            if (offset < dr->orig_offset) {
+                hi = mid - 1;
+            } else if (offset >= dr->orig_offset + dr->bytes) {
+                lo = mid + 1;
+            } else {
+                if (offset + len <= dr->orig_offset + dr->bytes) {
+                    *inner_offset = dr->pool_offset + (offset - dr->orig_offset);
+                    return g_dense_pool;
+                }
+                break;  /* range spans past this tensor — fall through to mmap */
+            }
+        }
+    }
+
     const uint64_t end = offset + len;
     for (uint32_t i = 0; i < g_model_view_count; i++) {
         if (g_model_views[i].model_map != model_map ||
@@ -4951,6 +5159,149 @@ static id<MTLBuffer> ds4_gpu_wrap_model_range(
             ds4_gpu_gib(offset),
             ds4_gpu_gib(end));
     return nil;
+}
+
+static int dense_range_cmp(const void *a, const void *b) {
+    const ds4_dense_range *ra = (const ds4_dense_range *)a;
+    const ds4_dense_range *rb = (const ds4_dense_range *)b;
+    if (ra->orig_offset < rb->orig_offset) return -1;
+    if (ra->orig_offset > rb->orig_offset) return 1;
+    return 0;
+}
+
+/*
+ * Build the dense resident pool from a list of (offset,len) tensor ranges.  Each
+ * range is copied from the mmap into one big resident MTLBuffer (real RAM, 256-B
+ * packed) and recorded in a sorted table for wrap_model_range to redirect to.
+ * The one-time memcpy faults the dense pages from SSD once (~6.5 GiB); afterwards
+ * decode reads them from RAM.  Returns 1 on success, 0 on alloc failure (caller
+ * then keeps the mmap-view path).
+ */
+int ds4_gpu_build_dense_resident_pool(const void *model_map, uint64_t model_size,
+                                      const uint64_t *offsets, const uint64_t *lens,
+                                      uint32_t n) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!model_map || n == 0 || !offsets || !lens) return 0;
+
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (offsets[i] > model_size || lens[i] > model_size - offsets[i]) {
+            fprintf(stderr, "ds4: dense pool range %u out of bounds; aborting pool build\n", i);
+            return 0;
+        }
+        total += (lens[i] + 255u) & ~(uint64_t)255u;
+    }
+
+    @autoreleasepool {
+        g_dense_pool = [g_device newBufferWithLength:(NSUInteger)total
+                                             options:MTLResourceStorageModeShared];
+        if (!g_dense_pool) {
+            fprintf(stderr, "ds4: dense resident pool alloc %.2f GiB failed\n", ds4_gpu_gib(total));
+            return 0;
+        }
+        g_dense_pool.label = @"ds4_dense_resident_pool";
+    }
+    g_dense_pool_bytes = (NSUInteger)total;
+
+    g_dense_ranges = (ds4_dense_range *)malloc((size_t)n * sizeof(ds4_dense_range));
+    if (!g_dense_ranges) {
+        @autoreleasepool { g_dense_pool = nil; }
+        g_dense_pool_bytes = 0;
+        return 0;
+    }
+
+    uint8_t *dst = (uint8_t *)g_dense_pool.contents;
+    const uint8_t *src = (const uint8_t *)model_map;
+    uint64_t cur = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        memcpy(dst + cur, src + offsets[i], (size_t)lens[i]);
+        g_dense_ranges[i].orig_offset = offsets[i];
+        g_dense_ranges[i].bytes       = lens[i];
+        g_dense_ranges[i].pool_offset = cur;
+        cur += (lens[i] + 255u) & ~(uint64_t)255u;
+    }
+    g_dense_range_count = n;
+    g_dense_model_map   = model_map;
+    g_dense_model_size  = model_size;
+    qsort(g_dense_ranges, n, sizeof(ds4_dense_range), dense_range_cmp);
+
+    fprintf(stderr,
+            "ds4: dense resident pool: %u tensors, %.2f GiB pinned in RAM "
+            "(non-routed weights; decode no longer page-faults them)\n",
+            n, ds4_gpu_gib(total));
+    return 1;
+}
+
+int ds4_gpu_register_mtp_resident_range(const void *model_map, uint64_t model_size,
+                                        uint64_t orig_offset, uint64_t bytes) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (g_mtp_resident_count >= DS4_MTP_RESIDENT_MAX) {
+        fprintf(stderr, "ds4: MTP resident registry full (max %d)\n", DS4_MTP_RESIDENT_MAX);
+        return 0;
+    }
+    if (!model_map || bytes == 0 || orig_offset > model_size || bytes > model_size - orig_offset) {
+        fprintf(stderr, "ds4: MTP resident range invalid (offset=%.2f GiB bytes=%.2f GiB)\n",
+                ds4_gpu_gib(orig_offset), ds4_gpu_gib(bytes));
+        return 0;
+    }
+    @autoreleasepool {
+        /* Wrap the mmap pages directly with newBufferWithBytesNoCopy — NO memcpy,
+         * NO new RAM allocation.  Pages fault from the file only when the GPU
+         * binds this buffer to a command buffer; between bursts the kernel can
+         * reclaim them.  This is the difference between idle replica = baseline
+         * (good) and idle replica = baseline + N GiB allocated MTLBuffers (bad).
+         *
+         * newBufferWithBytesNoCopy requires page-aligned pointer + length, so we
+         * round outwards.  wrap_model_range adjusts inner_offset from the
+         * aligned base to recover the tensor's exact byte position. */
+        const uint64_t page = (uint64_t)16 * 1024;
+        const uint64_t aligned_off = orig_offset & ~(page - 1);
+        const uint64_t end = orig_offset + bytes;
+        uint64_t aligned_end = (end + page - 1) & ~(page - 1);
+        if (aligned_end > model_size) aligned_end = model_size;
+        const uint64_t aligned_bytes = aligned_end - aligned_off;
+
+        id<MTLBuffer> buf = [g_device newBufferWithBytesNoCopy:
+                                (void *)((const uint8_t *)model_map + aligned_off)
+                                                       length:(NSUInteger)aligned_bytes
+                                                      options:MTLResourceStorageModeShared
+                                                  deallocator:nil];
+        if (!buf) {
+            fprintf(stderr, "ds4: failed to wrap MTP resident range %.2f GiB (offset %.2f GiB) as noCopy MTLBuffer\n",
+                    ds4_gpu_gib(aligned_bytes), ds4_gpu_gib(aligned_off));
+            return 0;
+        }
+        g_mtp_resident[g_mtp_resident_count].model_map      = model_map;
+        g_mtp_resident[g_mtp_resident_count].model_size     = model_size;
+        g_mtp_resident[g_mtp_resident_count].orig_offset    = orig_offset;
+        g_mtp_resident[g_mtp_resident_count].bytes          = bytes;
+        g_mtp_resident[g_mtp_resident_count].aligned_offset = aligned_off;
+        g_mtp_resident[g_mtp_resident_count].buffer         = buf;
+        g_mtp_resident_count++;
+        fprintf(stderr,
+                "ds4: MTP resident tensor wrapped (noCopy): offset %.2f GiB size %.2f GiB "
+                "— 0 bytes allocated, mmap-backed\n",
+                ds4_gpu_gib(orig_offset), ds4_gpu_gib(bytes));
+    }
+    return 1;
+}
+
+void ds4_gpu_set_view_cap_next_call(uint64_t bytes) {
+    g_view_cap_next_call = bytes;
+}
+
+void ds4_gpu_clear_mtp_resident_ranges(void) {
+    @autoreleasepool {
+        for (int i = 0; i < g_mtp_resident_count; i++) {
+            g_mtp_resident[i].buffer         = nil;
+            g_mtp_resident[i].model_map      = NULL;
+            g_mtp_resident[i].model_size     = 0;
+            g_mtp_resident[i].orig_offset    = 0;
+            g_mtp_resident[i].bytes          = 0;
+            g_mtp_resident[i].aligned_offset = 0;
+        }
+    }
+    g_mtp_resident_count = 0;
 }
 
 int ds4_gpu_indexer_score_one_tensor(
@@ -13607,6 +13958,210 @@ static int ds4_gpu_expert_offload_enabled(void) {
 }
 
 /*
+ * Persistent expert cache budget.  Enabled (returns >0 bytes) when
+ * DS4_EXPERT_CACHE_BYTES is a positive integer, layered on top of A3
+ * EXPERT_OFFLOAD.  Cached so the env read + log fire exactly once.
+ */
+static uint64_t ds4_gpu_expert_cache_budget_bytes(void) {
+    static long long cached = -1;
+    if (cached < 0) {
+        cached = 0;
+        const char *b = getenv("DS4_EXPERT_CACHE_BYTES");
+        if (b && b[0]) {
+            char *end = NULL;
+            long long v = strtoll(b, &end, 10);
+            if (v > 0) cached = v;
+        }
+        if (cached > 0) {
+            fprintf(stderr,
+                    "ds4: DS4_EXPERT_CACHE_BYTES=%lld: routed experts held in a "
+                    "persistent compact LRU pool; hot experts stay resident across "
+                    "tokens, only misses fault from SSD.\n", cached);
+        }
+    }
+    return (uint64_t)cached;
+}
+
+static int ds4_gpu_expert_cache_enabled(void) {
+    return ds4_gpu_expert_offload_enabled() &&
+           ds4_gpu_expert_cache_budget_bytes() > 0;
+}
+
+void ds4_gpu_set_expert_fetch_callback(ds4_expert_fetch_fn fn, void *ud) {
+    g_expert_fetch_cb = fn;
+    g_expert_fetch_ud = ud;
+}
+
+#define DS4_EXPERT_CACHE_MAX_LAYER 256
+
+/*
+ * Decode-path persistent expert cache fill.  For each of the n_active routed
+ * experts in active_ids[] (raw 256-id space, already read from the router on the
+ * CPU after the end_commands fence):
+ *   - hit  (g_expert_cache_map[(layer,id)] has a slot): reuse the resident bytes,
+ *           touch LRU; NO memcpy, NO SSD fault.
+ *   - miss: pick an LRU victim slot, skipping slots already claimed by THIS
+ *           layer's active set this call (so the <=6 experts can never evict each
+ *           other — correctness independent of pool size), memcpy gate/up/down
+ *           for that expert from the GGUF mmap into the slot (the sole
+ *           SSD-faulting path), update map/owner/lru.
+ * Emits the n_active compact slot ids into g_moe_selected_compact_buffer for the
+ * matmul.  Cache buffers (slot*expert_bytes; gate/up share gate_expert_bytes,
+ * down uses down_expert_bytes) and bookkeeping arrays are allocated lazily on
+ * the first call.  Returns 1 on success, 0 on allocation failure.
+ */
+static int ds4_gpu_expert_cache_lookup_or_fill(
+        const void *model_map,
+        uint32_t    layer,
+        uint32_t    n_active,
+        const uint32_t *active_ids,
+        uint64_t    gate_offset,
+        uint64_t    up_offset,
+        uint64_t    down_offset,
+        uint64_t    gate_expert_bytes,
+        uint64_t    down_expert_bytes,
+        uint32_t    n_expert_total) {
+    if (!model_map || n_expert_total == 0 || n_active == 0 || n_active > 6) return 0;
+    if (layer >= DS4_EXPERT_CACHE_MAX_LAYER) return 0;
+
+    const uint64_t per_slot = gate_expert_bytes + gate_expert_bytes + down_expert_bytes;
+    if (per_slot == 0) return 0;
+
+    if (g_expert_cache_n_slots == 0) {
+        uint64_t slots = ds4_gpu_expert_cache_budget_bytes() / per_slot;
+        if (slots < 8) slots = 8;                     /* floor so the pool is usable */
+        if (slots > (1u << 24)) slots = (1u << 24);   /* sanity ceiling */
+        g_expert_cache_n_slots = (uint32_t)slots;
+    }
+    const uint32_t n_slots = g_expert_cache_n_slots;
+
+    if (!ds4_gpu_ensure_scratch_buffer(&g_expert_cache_gate, &g_expert_cache_gate_bytes,
+                                       (NSUInteger)((uint64_t)n_slots * gate_expert_bytes),
+                                       "ds4_expert_cache_gate") ||
+        !ds4_gpu_ensure_scratch_buffer(&g_expert_cache_up, &g_expert_cache_up_bytes,
+                                       (NSUInteger)((uint64_t)n_slots * gate_expert_bytes),
+                                       "ds4_expert_cache_up") ||
+        !ds4_gpu_ensure_scratch_buffer(&g_expert_cache_down, &g_expert_cache_down_bytes,
+                                       (NSUInteger)((uint64_t)n_slots * down_expert_bytes),
+                                       "ds4_expert_cache_down")) {
+        return 0;
+    }
+
+    if (!g_expert_cache_map) {
+        g_expert_cache_map_entries = DS4_EXPERT_CACHE_MAX_LAYER * n_expert_total;
+        g_expert_cache_map        = malloc((size_t)g_expert_cache_map_entries * sizeof(int32_t));
+        g_expert_cache_slot_owner = malloc((size_t)n_slots * sizeof(int32_t));
+        g_expert_cache_lru        = malloc((size_t)n_slots * sizeof(uint64_t));
+        if (!g_expert_cache_map || !g_expert_cache_slot_owner || !g_expert_cache_lru) return 0;
+        for (uint32_t i = 0; i < g_expert_cache_map_entries; i++) g_expert_cache_map[i] = -1;
+        for (uint32_t s = 0; s < n_slots; s++) { g_expert_cache_slot_owner[s] = -1; g_expert_cache_lru[s] = 0; }
+    }
+
+    if (!ds4_gpu_ensure_scratch_buffer(&g_moe_selected_compact_buffer, &g_moe_selected_compact_bytes,
+                                       (NSUInteger)((uint64_t)n_active * sizeof(int32_t)),
+                                       "ds4_moe_selected_compact")) {
+        return 0;
+    }
+    int32_t *compact = (int32_t *)g_moe_selected_compact_buffer.contents;
+
+    uint8_t *gate_dst = (uint8_t *)g_expert_cache_gate.contents;
+    uint8_t *up_dst   = (uint8_t *)g_expert_cache_up.contents;
+    uint8_t *down_dst = (uint8_t *)g_expert_cache_down.contents;
+    const uint8_t *map = (const uint8_t *)model_map;
+    if (!gate_dst || !up_dst || !down_dst || !compact) return 0;
+
+    int32_t  assigned[6];      /* slots claimed by this layer's active set this call */
+    uint32_t n_assigned = 0;
+    uint32_t miss_ids[6];      /* ids that missed; filled in one batch after the loop */
+    int32_t  miss_slot[6];
+    uint32_t n_miss = 0;
+
+    for (uint32_t i = 0; i < n_active; i++) {
+        uint32_t id = active_ids[i];
+        if (id >= n_expert_total) id = 0;
+        const uint32_t key = layer * n_expert_total + id;
+        const int32_t slot = g_expert_cache_map[key];
+        if (slot >= 0) {
+            g_expert_cache_lru[slot] = ++g_expert_cache_clock;
+            compact[i] = slot;
+            assigned[n_assigned++] = slot;
+            g_diag_cache_hits++;
+            continue;
+        }
+        /* miss: prefer an empty slot, else LRU-min, skipping this layer's claims. */
+        int32_t  victim = -1;
+        uint64_t best_lru = UINT64_MAX;
+        for (uint32_t s = 0; s < n_slots; s++) {
+            int skip = 0;
+            for (uint32_t a = 0; a < n_assigned; a++) if (assigned[a] == (int32_t)s) { skip = 1; break; }
+            if (skip) continue;
+            if (g_expert_cache_slot_owner[s] < 0) { victim = (int32_t)s; break; }
+            if (g_expert_cache_lru[s] < best_lru) { best_lru = g_expert_cache_lru[s]; victim = (int32_t)s; }
+        }
+        if (victim < 0) return 0;  /* unreachable: n_slots floor 8 > 6 claims */
+        if (g_expert_cache_slot_owner[victim] >= 0) {
+            g_expert_cache_map[g_expert_cache_slot_owner[victim]] = -1;
+            g_diag_cache_evicts++;
+        }
+        /* Defer the byte fill: claim the slot now (so later iterations in this
+         * layer skip it), record the miss, and fill all misses in one batch
+         * after the loop — remote pull if a fetch callback is set, else mmap. */
+        g_expert_cache_map[key]          = victim;
+        g_expert_cache_slot_owner[victim] = (int32_t)key;
+        g_expert_cache_lru[victim]        = ++g_expert_cache_clock;
+        compact[i] = victim;
+        assigned[n_assigned++] = victim;
+        miss_ids[n_miss]  = id;
+        miss_slot[n_miss] = victim;
+        n_miss++;
+        g_diag_cache_misses++;
+    }
+
+    if (n_miss > 0) {
+        int remote_ok = 0;
+        if (g_expert_fetch_cb) {
+            /* One batched round-trip for this layer's misses: gather gate||up||
+             * down per id into a contiguous buffer, then scatter into the slots. */
+            const uint64_t blk = 2u * gate_expert_bytes + down_expert_bytes;
+            const size_t want = (size_t)n_miss * (size_t)blk;
+            if (g_expert_fetch_buf_bytes < want) {
+                free(g_expert_fetch_buf);
+                g_expert_fetch_buf = malloc(want);
+                g_expert_fetch_buf_bytes = g_expert_fetch_buf ? want : 0;
+            }
+            if (g_expert_fetch_buf &&
+                g_expert_fetch_cb(g_expert_fetch_ud, layer, n_miss, miss_ids,
+                                  g_expert_fetch_buf, gate_expert_bytes, down_expert_bytes)) {
+                const uint8_t *src = (const uint8_t *)g_expert_fetch_buf;
+                for (uint32_t m = 0; m < n_miss; m++) {
+                    const uint64_t gs = (uint64_t)miss_slot[m] * gate_expert_bytes;
+                    const uint64_t ds = (uint64_t)miss_slot[m] * down_expert_bytes;
+                    memcpy(gate_dst + gs, src, (size_t)gate_expert_bytes); src += gate_expert_bytes;
+                    memcpy(up_dst   + gs, src, (size_t)gate_expert_bytes); src += gate_expert_bytes;
+                    memcpy(down_dst + ds, src, (size_t)down_expert_bytes); src += down_expert_bytes;
+                }
+                remote_ok = 1;
+                g_diag_cache_remote += n_miss;
+            }
+        }
+        if (!remote_ok) {
+            /* Local fallback: memcpy each miss from the mmap (SSD-faulting path). */
+            for (uint32_t m = 0; m < n_miss; m++) {
+                const uint64_t gs = (uint64_t)miss_slot[m] * gate_expert_bytes;
+                const uint64_t ds = (uint64_t)miss_slot[m] * down_expert_bytes;
+                const uint64_t id_gate = (uint64_t)miss_ids[m] * gate_expert_bytes;
+                const uint64_t id_down = (uint64_t)miss_ids[m] * down_expert_bytes;
+                memcpy(gate_dst + gs, map + gate_offset + id_gate, (size_t)gate_expert_bytes);
+                memcpy(up_dst   + gs, map + up_offset   + id_gate, (size_t)gate_expert_bytes);
+                memcpy(down_dst + ds, map + down_offset + id_down, (size_t)down_expert_bytes);
+            }
+            g_diag_cache_pagein_bytes += (uint64_t)n_miss * per_slot;
+        }
+    }
+    return 1;
+}
+
+/*
  * #55 A3: ensure the three routed-MoE scratch buffers are allocated at the
  * full 256-slot tensor size and copy the active experts' bytes from the GGUF
  * mmap into the corresponding slots.  Layout in scratch is identical to the
@@ -13785,7 +14340,13 @@ int ds4_gpu_routed_moe_one_tensor(
          * rest of this function dispatches into a clean per-layer CB.  When
          * not in batched mode (standalone CB), the upstream caller has already
          * synchronized so we can read directly.
+         *
+         * When the persistent expert cache is enabled the same end_commands
+         * fence + CPU readback runs, but the fill goes through the cache (hits
+         * skip the memcpy entirely) and the matmul reads the compact cache
+         * buffers indexed by compact slot ids.
          */
+        const int cache_used = ds4_gpu_expert_cache_enabled();
         if (ds4_gpu_expert_offload_enabled()) {
             const int was_batched = (g_batch_cb != nil);
             /* #58 Lvl 2: timing the A3 sync path.  Three intervals per layer
@@ -13817,18 +14378,36 @@ int ds4_gpu_routed_moe_one_tensor(
                 if (raw < 0) raw = 0;
                 active_ids[i] = (uint32_t)raw;
             }
-            const int load_ok = ds4_gpu_load_layer_experts_to_scratch(
-                model_map, layer, n_expert, active_ids,
-                gate_offset, up_offset, down_offset,
-                gate_expert_bytes, down_expert_bytes, n_expert_total);
+            int load_ok;
+            if (cache_used) {
+                load_ok = ds4_gpu_expert_cache_lookup_or_fill(
+                    model_map, layer, n_expert, active_ids,
+                    gate_offset, up_offset, down_offset,
+                    gate_expert_bytes, down_expert_bytes, n_expert_total);
+            } else {
+                load_ok = ds4_gpu_load_layer_experts_to_scratch(
+                    model_map, layer, n_expert, active_ids,
+                    gate_offset, up_offset, down_offset,
+                    gate_expert_bytes, down_expert_bytes, n_expert_total);
+            }
             if (!load_ok) {
                 if (was_batched) (void)ds4_gpu_begin_commands();
                 return 0;
             }
             const uint64_t t2 = diag ? ds4_diag_ns_now() : 0;
-            gate_buf = g_moe_scratch_gate;
-            up_buf = g_moe_scratch_up;
-            down_buf = g_moe_scratch_down;
+            if (cache_used) {
+                /* Compact cache buffers; selected now holds compact slot ids
+                 * produced on the CPU, so route_translate is skipped below. */
+                gate_buf = g_expert_cache_gate;
+                up_buf   = g_expert_cache_up;
+                down_buf = g_expert_cache_down;
+                selectedbuf = g_moe_selected_compact_buffer;
+                selected_off = 0;
+            } else {
+                gate_buf = g_moe_scratch_gate;
+                up_buf = g_moe_scratch_up;
+                down_buf = g_moe_scratch_down;
+            }
             gate_inner = 0;
             up_inner = 0;
             down_inner = 0;
@@ -13865,12 +14444,16 @@ int ds4_gpu_routed_moe_one_tensor(
             return 0;
         }
 
+        /* ne02 (src0_experts) is carried in args but never bounds the kernel's
+         * expert index; with the cache the indexable dimension is the slot
+         * count, not 256.  nb02 (per-expert stride) stays = expert_bytes. */
+        const uint32_t mm_experts = cache_used ? g_expert_cache_n_slots : n_expert_total;
         ds4_gpu_mul_mv_id_args gate_args =
-            ds4_gpu_make_mul_mv_id_args(expert_in_dim, expert_mid_dim, n_expert_total,
+            ds4_gpu_make_mul_mv_id_args(expert_in_dim, expert_mid_dim, mm_experts,
                                           gate_row_bytes, gate_expert_bytes,
                                           1, n_expert, n_tokens, gate_nr0);
         ds4_gpu_mul_mv_id_args down_args =
-            ds4_gpu_make_mul_mv_id_args(expert_mid_dim, out_dim, n_expert_total,
+            ds4_gpu_make_mul_mv_id_args(expert_mid_dim, out_dim, mm_experts,
                                           down_row_bytes, down_expert_bytes,
                                           n_expert, n_expert, n_tokens, down_nr0);
 
@@ -13887,7 +14470,7 @@ int ds4_gpu_routed_moe_one_tensor(
          * any leftover dropped id falls back to slot 0 (a harmless duplicate
          * read that gets re-weighted by the router's softmax mask anyway).
          */
-        if (g_expert_keep_lut_buffer != nil && g_dsv4_route_translate_pipeline != nil) {
+        if (!cache_used && g_expert_keep_lut_buffer != nil && g_dsv4_route_translate_pipeline != nil) {
             const NSUInteger compact_bytes = (NSUInteger)n_expert * sizeof(int32_t);
             if (!ds4_gpu_ensure_scratch_buffer(&g_moe_selected_compact_buffer,
                                                  &g_moe_selected_compact_bytes,
