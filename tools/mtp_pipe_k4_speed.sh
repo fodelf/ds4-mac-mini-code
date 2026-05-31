@@ -30,9 +30,11 @@ REMOTE_DIR=${REMOTE_DIR:-/Users/fodelf/ds4-main}
 LOCAL_DIR=${LOCAL_DIR:-/Users/fodelf/git/ds4-main}
 WORKER_IP=${WORKER_IP:-192.168.1.2}            # M1 雷电 IP: worker 在此 listen 控制端口, M4 coordinator 拨此
 PORT=${PORT:-5599}
-# k16 (保留 256 专家里 16 个) 能正常出 token; k4 (只留 4 个) 退化, prefill 后首 token 即 EOS、
-# 无法测 decode。注意 k16 (13G) 比 k4 (9.3G) 大, worker 切片+MTP 常驻更高, 若 M1 GPU OOM
-# 需调小 PREFILL_CHUNK 或给 worker 更少层 (SPLIT_WORKER)。两机各自从同一 gguf 加载自己那段层切片。
+# 档位: k4(4/256 退化,首token即EOS,无法测decode) / k16(16/256 能出token,双机可跑通) /
+# k48(48/256,质量最好但 23.4G, 43 层装不进两台 16GB 合计 GPU 工作集 ~22.5 GiB, 大概率 OOM)。
+# k16 (13G) 比 k4 大, worker 切片+MTP 常驻更高, 若 M1 GPU OOM 需调小 PREFILL_CHUNK 或给 worker
+# 更少层 (SPLIT_WORKER)。两机各自从同一 gguf 加载自己那段层切片。
+# 跑 k48 (有风险): MODEL=gguf/ds4flash-k48.gguf SPLIT_COORD=0:20 SPLIT_WORKER=21:output NO_MTP=1 覆盖。
 MODEL=${MODEL:-gguf/ds4flash-k16.gguf}
 MTP_GGUF=${MTP_GGUF:-gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf} # 草稿模型, 仅 M1 worker 加载
 # 层切分 (block_count=43, layers 0..42)。本机 M4 扛大部分前段, M1 扛少部分末段 + output + MTP。
@@ -165,8 +167,15 @@ done
 echo
 
 # ---------------- 7. 结果 (在本机 coordinator 日志) ----------------
-log "本机 coordinator 生成文本:"
-grep -v -E '^ds4:|^ds4_profile' "$COORD_LOG" | tail -8
+# 注: 生成文本可能含大量换行 token (尤其退化的 reduced-expert 模型), 末尾常是成片空行。
+# 必须先滤掉纯空白行再 tail, 否则 tail 全抓到尾部空行 → 看着像"没输出文本"(其实内容在前面)。
+log "本机 coordinator 生成文本 (已滤 ds4 日志行与纯空白行):"
+gen_lines=$(grep -v -E '^ds4:|^ds4_profile' "$COORD_LOG" | grep -v -E '^[[:space:]]*$')
+if [ -n "$gen_lines" ]; then
+  printf '%s\n' "$gen_lines" | tail -20
+else
+  log "(无非空文本行: 本次生成可能全是换行/空白 token —— k4/k16 等退化模型常见)"
+fi
 echo "----------------------------------------"
 if grep -qiE 'prefill:|generation:|t/s' "$COORD_LOG" 2>/dev/null; then
   log "速度 (本机 coordinator):"; grep -iE 'prefill:|generation:|t/s' "$COORD_LOG" | tail -2
