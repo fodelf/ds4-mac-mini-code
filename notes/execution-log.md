@@ -914,3 +914,383 @@ tp_owns_low 仍按 role 不按谁 listen。CLI 校验放宽(reverse 时 coordina
 
 **脚本**: tools/tp_k4_speed.sh 已改 reverse 版(worker listen 先起, coordinator connect 后起,
 端口清理, RUN_ENV 含 DS4_TP_REVERSE_CONNECT=1)。
+
+---
+
+## 2026-05-31 双机 k4 比单机慢 — 根因定位 + TP all-reduce 全双工修复
+
+**现象**: k4 (10GB, 进 16G RAM) 双机 TP decode ~3 t/s, 单机 ~10+ t/s。
+
+**根因分解 (代码证据)**:
+1. **每 token 3 次「GPU 排空 + 同步 all-reduce」硬屏障, 零重叠 (主因)** —
+   `ds4.c:11124-11164` 对前 tp_layers(=3) 每层: tp_signal_after_batch →
+   flush_commands(commit, 切断整 token 的单 CB 批) → tp_host_wait(排空 GPU 到本层) →
+   tensor_read → all-reduce → tensor_write。单机是整 token 一个 CB 末尾等一次;
+   双机把一个 token 切成 4 段串行, GPU 算时网络空、网络会合时 GPU 空, 无重叠。
+2. **all-reduce 传输是严格串行交换 (本次修复点)** — `ds4_distributed.c` 旧
+   `ds4_dist_tp_allreduce_f32`: 一方先发后收、另一方先收后发 ⇒ 2 个单向传输背靠背
+   (连接方收完才发), 每屏障网络部分白白翻倍。
+3. **element-split 对 k4 零收益** — 两机算同样 6 专家, 纯屏障开销 (执行记录已记)。
+4. **混淆量**: 脚本 RUN_ENV 强开 EXPERT_OFFLOAD+NO_RESIDENCY, 但 k4 进 RAM 不需要;
+   NO_RESIDENCY 下每个 flush 的新 CB 重新 wire 模型页 (见 [[metal_buffer_residency_per_buffer_granularity]]),
+   与 TP 屏障恶性叠加。单机 10+ t/s 大概率是没开这俩 flag 测的 ⇒ 3 t/s 里 TP 占多少、
+   offload 占多少现在混在一起。
+
+**本次代码改动 (ds4_distributed.c)**:
+- `ds4_dist_tp_allreduce_f32` 串行交换 → **全双工 poll 泵 `dist_tp_exchange`**: 一个
+  poll 循环同时推本端帧(header+payload)、收对端帧, TCP 全双工下墙钟 2 串行传输 → ≈1 单向延迟。
+  read 侧随时排空 ⇒ 任意 payload 大小无死锁, send_first 不再相关 (两端同路径)。
+- TP socket 在 dist_tp_alloc 设 O_NONBLOCK (加 `#include <fcntl.h>`); 通用帧 helper
+  (dist_write_full 等) 仍被协议其余部分用, 不动; TP 专用 recv_vec/send_vec 删除。
+- **验证**: `make ds4` 0 warning; `ds4_dist_tp_selftest` (socketpair 双线程, 4096 float,
+  无模型) **PASS** — 求和逐字正确 + 帧格式校验通过。两机需同步重编 (CORE_OBJS 共享 ds4_distributed.o)。
+
+**诚实评估 (decision gate)**: 全双工只削减屏障的网络分量 (sub-ms 级), **不是 3 t/s 主因**;
+主因是原因 1 的 GPU-drain×3 + 原因 4 的 offload/no-residency 暴露。要拿大头, 用户侧两步:
+(a) k4 跑 TP 时 RUN_ENV 去掉 EXPERT_OFFLOAD+NO_RESIDENCY (k4 进 16G 安全) — 隔离并消掉 wire 开销;
+(b) 认清 element-split TP 对能进单机的 k4 永远负收益, 要省内存/提速得换 layer-pipeline 拓扑 (每 token 1 跳)。
+脚本可用 `RUN_ENV="DS4_TP_REVERSE_CONNECT=1" ./tools/tp_k4_speed.sh` 做 (a) 的对照。
+
+---
+
+## 2026-05-31 (续) 双机 k4 慢的真正主因裁决 + 脚本默认改 (offload off / tp_layers=1)
+
+**物理天花板 (诚实)**: 单 token 自回归 decode 是顺序、延迟绑定的; k4 整个进单机 16G。
+这种「能进单机」的模型, **两机物理上不可能让单 token decode 比单机快** —— element-split
+让两机冗余算同样 attn/dense/shared (没切), 只切占比很小的 routed 专家, 却每 token 多付
+tp_layers 次跨机屏障。dual k4 的上界 = 从下方逼近单机, 永不超过。两机价值在 82GB 全模型 + prefill。
+
+**3 t/s 的真正主因 (修正之前"全双工是边角料"的定位)**: 不是 TP 同步, 是脚本给 k4 强开
+`DS4_METAL_EXPERT_OFFLOAD=1 DS4_METAL_NO_RESIDENCY=1`。k4 8.2G backbone 进得了 16G,
+不需要 offload; 开了它 → 每次 TP flush 的新 CB 重新 wire 模型页 (见
+[[metal_buffer_residency_per_buffer_granularity]]), 把每屏障税放大几十倍。单机 10+ t/s
+是 resident(无 offload) 测的, 双机带 offload 测 → 不是同一配置, 3 vs 10 主要是 offload 差。
+
+**脚本默认改 (tools/tp_k4_speed.sh)**:
+- `RUN_ENV` 默认去掉 OFFLOAD+NO_RESIDENCY, 只留 `DS4_TP_REVERSE_CONNECT=1` (k4 常驻, 屏障廉价)。
+  82GB 全模型时 env 覆盖加回。
+- `TP_LAYERS` 默认 3→1 (k4 上每 tp-layer 是纯屏障税, =1 最小屏障)。
+- 看门狗 `LOCAL/REMOTE_MAX_GB` 12→14 (offload off 后 k4 resident ~10-11G = 单机已安全足迹;
+  14 不误杀又留 2G 给 OS, 不怼红线)。内存安全: 每机 = 单机 k4 的已证明 footprint, 非双载。
+
+**预期**: dual k4 应从 3 t/s 升到逼近单机 (~8-10 t/s); 不会超过单机。若没到 10, 残余是
+3 次→1 次屏障的 CB flush+event 延迟, 进一步只能换 layer-pipeline 拓扑 (每 token 1 跳) 或认账。
+全双工 all-reduce (上一条) 仍保留, 削减屏障网络分量。**未跑模型** (用户手动跑, Ctrl+C 在手)。
+
+---
+
+## 2026-05-31 — mtp.md Phase 1 方案A 启动 (跨机 MTP 投机骨架)
+
+**决定**: 用户选「方案A Phase1 骨架」(层切分 A:0-32/B:33-42 + MTP drafter 在持末层的 worker)。
+诚实定位 (沿用 mtp.md §2/§8): 此骨架对 k4 decode 是**净成本** (无内存收益 + 多一跳),
+价值是「大模型 + MTP」通用骨架; k4 单流真正提速靠 Phase2 方案B (B 纯 drafter 异步抢跑)。
+
+**实施纪律**: 原子增量, 每步 `make` 编译验证, **全程不运行** (安全闸: 等用户双机终端手动跑,
+Ctrl+C 在手; 两机共享 CORE_OBJS, 改完两机都要重编 + 传二进制)。
+
+**增量拆分**:
+- #1 协议帧 + `--mtp-role` 骨架: WORK 加 `DS4_DIST_WORK_F_DRAFT` 标志 + `accept_len`/`draft_cap`
+  字段; RESULT 加 `draft_count`; to/from wire; CLI `--mtp-role worker`。memset 零初始化保证
+  既有路径字节不变 (新字段=0 → 行为同旧)。
+- #2 worker 出 final hidden 后调 `metal_graph_eval_mtp_draft` 产 K 候选, 打包进 RESULT 回传。
+- #3 coordinator 把 [verified, draft_0..K-1] 走分布式批量前向 (复用 chunk 批通道) 跨机验证,
+  逐位贪婪比对定 accept_len。
+- #4 跨机 KV 回滚: 下一 WORK 带 accept_len, worker 截断自身层切片 KV; 滚动哈希纳入已接受前缀。
+
+正确性判据 (Phase1 收尾): 双机+MTP 输出 == 单机+MTP 输出 (逐 token, --temp 0 --seed 1), 再看 t/s。
+
+### 增量2 落地 (worker 出 final hidden 后调 MTP draft 回传) — 编译通过, 未运行
+
+**ds4.c**:
+- loader 放开: `mtp_for_worker_draft = (role==WORKER && mtp_draft_on_worker && load_output)`;
+  原本 `role==NONE` 才载 MTP, 现允许 draft worker 载 MTP 模型 + 置 `mtp_ready`(图随之分配 MTP 状态)。
+- `weights_model_map_spans` 加 `include_token_embd` 参数; draft worker(layer_start≠0) 补 token_embd
+  进 residency span(MTP head 要从 base token_embd re-embed draft token)。代价 ~1-1.85 GiB 常驻。
+- 新公开 API `ds4_session_mtp_draft(s, verified_token, pos, max_k, drafts, *out_n, ...)`:
+  镜像单机递归(首 draft 用 cur_hc=末层 final hidden → mtp_state_hc; 后续 ping-pong
+  mtp_state_hc/mtp_next_hc)。greedy-only。MTP 不可用时返 0+out_n=0(调用方回退普通 decode)。
+  speculative 行的 mtp_n_raw 回滚留给增量4(accept_len)。
+
+**ds4_distributed.c**:
+- `dist_send_work_result` / `dist_worker_upstream_send_work_result` 加 `draft_tokens`/`draft_count`
+  参数; draft token(uint32 htonl)写在 logits payload 之后; `result_fixed.draft_count` 标数量。
+- worker eval 成功且 `local_output_logits && DRAFT 标志 && draft_cap>0` 时(持 state->mu 锁内,
+  cur_hc 仍有效), 调 `ds4_session_mtp_draft` 取 K 候选, 随 RESULT 发送。
+  verified=tokens[n-1], pos=pos0+n-1 (与单机一致: 输入 token 在自身位置)。
+
+**安全性**: coordinator 尚未设 DRAFT 标志/draft_cap(增量3 才编排), 故 worker want_draft 恒 false,
+**既有双机/TP 路径运行时字节不变**。token_embd 常驻只在 `--mtp-role worker` 时发生。
+
+### 增量3+4 落地 (coordinator 跨机批量验证 + 跨机 KV 回滚) — 编译通过, 未运行
+
+**核心安全性质 (决定了为何敢 blind 写)**:
+1. 输出正确性由 **target argmax 门控** —— draft 再错只是验证不过/少接受, 绝不污染输出。
+2. KV 正确性由 **滚动哈希不匹配 → dist_coordinator_rebuild_from_transcript 全量重建** 兜底。
+→ 投机路径所有 KV/MTP-cache/回滚 bug 都是**纯速度问题, 绝不出错**。据此乐观实现 + fail-safe。
+
+**ds4.c**:
+- `ds4_session_verify_batch_argmax`: worker 切片逐行验证器, 跑 layer_start..final + output_head_batch
+  → 读 K 行 logits (spec_logits, 复用单机批量验证器机制); check+commit timeline。
+- `ds4_session_layer_slice_rollback(new_len)` / `ds4_session_layer_slice_len`: 截断 timeline 到
+  new_len (position 环形 KV 下次 eval 覆盖陈旧行, = 单机 MTP 回滚做法 20714)。
+
+**ds4_distributed.c**:
+- WORK 加 `DS4_DIST_WORK_F_VERIFY`; `ds4_dist_spec_io` 结构穿过 eval_span/eval_remote_on_fd
+  (普通调用传 NULL, 非投机路径字节不变); recv_result 修尺寸校验扣 draft 字节 + 读候选。
+- worker: accept_len 回滚 (session 取得后/prefix 校验前, 用 spec_base_len+accept_len 截断+重算哈希);
+  VERIFY 帧走 verify_batch_argmax 返 K 行 logits + 记 spec_base/spec_pending。
+- coordinator `ds4_dist_session_eval_speculative`: 双轮 ——
+  R1 DRAFT(eval first_token + 带上轮 accept_len 回滚 + 取 K drafts);
+  argmax(logits)==drafts[0] 才进 R2 VERIFY(K 候选批量前向 → K 行 logits);
+  逐行 argmax 链式接受定 m; 本地 owner KV 立即回滚到 p+1+m, worker 回滚 accept_len=m 推迟到下一帧。
+- `--mtp-role worker` 在 coordinator 端置 state.mtp_draft(请求投机), 在 worker 端置载 MTP+token_embd。
+  coordinator 只需 `--mtp-role worker`, worker 需 `--mtp FILE --mtp-role worker`。
+
+**已知未验证假设 (双机跑时重点查)**:
+- 投机仅 decode(pos>0): R1 走 eval_layer_slice decode 路径 → cur_hc=末层 final hidden (draft 前提)。
+- 两机回滚位置一致: worker spec_base=R2 pos0=p+1, +accept_len=m == coordinator owner 回滚 p+1+m。
+- R2 verify 帧 OUTPUT_LOGITS 来自 route 末跳 flag; worker is_verify 需 local_output_logits。
+- MTP raw cache(mtp_n_raw) 跨投机周期未精确回滚 → 仅影响 draft 质量(=速度), 被 argmax 门控兜底。
+- 带宽: R2 回传 K×vocab×4 (K≤16) logits; 典型 K=4 ≈ 2MB/周期。
+
+**验证协议 (Phase1 收尾, 用户双机手动跑)**:
+正确性: 双机+MTP 输出 == 单机+MTP 输出 (逐 token, --temp 0 --seed 1); 任何分歧查上面假设。
+启动: coordinator `--role coordinator --layers 0:32 --mtp-role worker ...`;
+      worker `--role worker --layers 33:output --mtp gguf/<mtp>.gguf --mtp-role worker ...`。
+两机共享 CORE_OBJS, 必须同步重编 + 传二进制。本机已编译, **未运行** (等用户终端手动跑)。
+
+### 测试脚本 + K-source bug 修复 (2026-05-31 续)
+
+**修复 (写脚本时发现的真 bug)**: `ds4_dist_session_eval_speculative` 用 `ds4_engine_mtp_draft_tokens()`
+取 K, 而该 accessor 门控 `has_mtp`(要求 role==NONE && mtp_ready) → coordinator(role=COORDINATOR,
+不载 MTP) 恒返 0 → K<2 → 投机永远回退普通 decode, **投机根本不触发**。
+加 `ds4_engine_mtp_draft_tokens_configured()`(不门控, 返 e->mtp_draft_tokens), 驱动改用它。
+
+**网络拓扑结论 (零代码绕开 M1 出站 connect bug)**:
+- 层切分 2 机解码唯一跨机 connect = worker→coordinator (`use_control_for_work` 下 WORK 走
+  worker 主动连入的连接, `dist_coordinator_build_route_plan` 用 `dup(w->fd)`);
+  coordinator 解码期零出站 (出站仅存/取盘 5033/5150)。
+- → **M1 当 coordinator(只 accept) / 本机当 worker(本机出站连 M1, 通)**: 零 M1 出站, 零代码。
+  本机(16GB) 持更小的 33:output 切片 + MTP, 内存也更省。不需要写层切分 reverse-control。
+
+**新脚本 `tools/mtp_pipe_k4_speed.sh`** (区别于 tp_k4_speed.sh 的 TP 拓扑):
+- M1 coordinator `--listen --layers 0:32 --mtp-role worker --mtp-draft 4 -p "<代码题>" --temp 0 --seed 1`
+  (出结果+计时在 M1, 脚本 ssh 读回)。
+- 本机 worker `--coordinator M1 --layers 33:output --mtp <draft.gguf> --mtp-role worker --mtp-draft 4`。
+- 复用 rsync→M1 / 两边 clean+make ds4 (共享 CORE_OBJS 必须都重编) / 看门狗(两边同杀,只杀进程)
+  / DS4_MEM_BUDGET_MB 预算闸。先起 coordinator(等 worker 入队), 再起 worker。
+- 投机触发四要件齐: 两机 --mtp-role worker + 两机 --mtp-draft>=2 + worker --mtp FILE + --temp 0。
+- **未运行** (会加载模型+实跑, 等用户确认内存预算后手动跑, Ctrl+C 在手)。
+
+**正确性验证仍是 Phase1 收尾闸**: 双机+MTP 输出 == 单机+MTP 输出 (逐 token)。分歧查 5 条未验证假设。
+
+---
+
+## 2026-05-31 — mtp_pipe_k4_speed.sh 三连修复 (脚本 bug + 草稿模型路径 + M1 Pro coordinator GPU OOM)
+
+**症状链。** `./tools/mtp_pipe_k4_speed.sh` 连续三次报错, 逐个定位:
+1. `line 36: 草稿模型,: command not found` + `line 80: MTP_GGUF: unbound variable`
+   — 第 36 行 `}` 与行内注释 `#` 之间漏空格。bash 只把*词首* `#` 当注释, 紧贴 `}` 的 `#`
+   不是注释 → 整行变成「临时变量前缀 + 执行命令 `草稿模型,`」, 赋值只是失败命令的临时前缀,
+   `MTP_GGUF` 从没进环境 → 后面 `set -u` 报 unbound。修: 补空格。
+2. `本机缺草稿模型 gguf/ds4flash-k4-mtp.gguf` — 默认草稿模型路径写错; 本机实际 MTP draft 是
+   `gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf` (3.63 GiB)。修: 改默认 MTP_GGUF。
+3. **真正的硬骨头** — 运行期 M1 Pro coordinator (192.168.1.2, 16GB):
+   `Metal command batch failed: Insufficient Memory (kIOGPUCommandBufferCallbackErrorOutOfMemory)`
+   → prefill 失败 → coordinator 退出 → cleanup 杀 worker (本机 worker `coordinator disconnected`,
+   `missing layer 33` 是结果不是因)。
+
+**根因 (3)。** block_count=43 (layers 0..42)。旧切分 0:32/33:output 把 **33 层全压 coordinator**
+= 7.51 GiB 模型常驻。M1 Pro `iogpu.wired_limit_mb=0` (默认工作集 ~10.6G); vm_stat active 仅 ~5.6G
+(物理够), 有效 GPU 上限 ≈ 16-5.6 ≈ 10.4G。7.51G 模型在此就爆 → 图瞬时缓冲 ~3G。footprint 只报
+3.6G 是因为不计常驻 residency set (印证 metal_buffer_residency_per_buffer_granularity: 整 buffer 全 wire)。
+M4 单机能跑 10G 常驻是因为后台占用更少、headroom 更大; 脚本错误假设两台 16GB 等价。
+
+**修 (3): 数据驱动重切分, 不抬 iogpu (拒绝怼物理红线, 守 平稳>极限)。**
+硬数据: 原始 coord=33 层爆; worker=10 层+MTP(3.63G) 健康 (~7G 富余)。每层 ~0.18 GiB,
+embed/lm_head ~1.5G。coord 留 ~1.5G 余量 → 模型 ≤ 6.4G ≤ 27 层。worker 吸收剩余 16 层。
+→ `SPLIT_COORD=0:26` (27 层 ~5.4G+token_embd), `SPLIT_WORKER=27:output` (16 层 ~4.4G+3.63G MTP)。
+两台各 < 单机全模型足迹, 非双载。看门狗 14G + L1 预算闸 13.5G 不变。
+
+**状态。** 脚本 3 处已改, bash -n 通过。**未运行** (会两机加载+实跑, 守 memory-safety gate, 等用户
+确认后手动跑, Ctrl+C 在手)。risk: worker(M4) 现 ~8-9G + 图缓冲, 若它反过来 OOM 则把切分点再往后挪
+(给 worker 更少层); coord 仍有余量可接更多层。跑后看两边 "tensor span GiB" 行校准 0.18/层 估算。
+
+---
+
+## 2026-05-31 (续) — 切分修好 OOM 后, 暴露 generation: 0.00 t/s (首-token-EOS)
+
+**新症状。** 0:26/27:output 重切分后 M1 Pro coordinator 不再 OOM: 常驻 6.41 GiB, route ready,
+**prefill 成功 10.47 t/s**, 但 `generation: 0.00 t/s`, 零生成文本, coordinator 干净退出 (无报错)。
+
+**代码定位 (两条硬结论)。**
+1. 机制: ds4_cli.c:1261 解码循环里, 首个 `ds4_session_sample` 采样的 token 若 == EOS 立即 break,
+   generated 停在 0 → generation 0.00。投机路径 (1272) 在首 sample 之后才触发。
+2. `ds4_engine_mtp_draft_tokens()` (ds4.c:17796) 在引擎未加载 MTP 时返回 0。coordinator 不加载
+   MTP (仅 worker 载), 故它返回 0 → CLI 投机门 `mtp_draft_tokens>1` 在 coordinator 永远为假
+   → 走普通解码。所以 generated=0 ⟹ **首 token 即 EOS ⟹ prefill 末位 logits 的 argmax = EOS,
+   即 prefill logits 是错的**。
+
+**顺带发现的真 bug (记下, 暂不修)。** 投机门用了 `ds4_engine_mtp_draft_tokens()`, 但 ds4.c:17804
+专为 coordinator 准备了 `ds4_engine_mtp_draft_tokens_configured()` (返回原始 --mtp-draft, 不要求本地
+载 MTP; 注释明说"coordinator 编排投机但不载 MTP, 需原始值")。CLI 一次性生成路径 (1272) 用错了访问器
+→ 即使 logits 修好, coordinator 也永不发起跨机投机, MTP 形同虚设。修法: 1272(及 601 同构处) 改用
+`_configured`。但这不解释首-token-EOS, 优先级在后。
+
+**首-token-EOS 假设。** worker 日志: 主模型 27:output 映射后, 又映射 MTP 为 "37 overlapping shared
+buffers"(重叠)。强假设: worker 载 MTP drafter 时其 token_embd/output 与主模型 output head buffer
+重叠串扰, 污染 worker 回传的主模型 prefill logits → argmax=EOS。注意 prefill 路径与 MTP 无关、字节
+一致 (ds4_distributed.c:2680 注释), 所以若纯管线 logits 本就错, NO_MTP 也会复现。
+
+**已加隔离开关 NO_MTP=1** (脚本): 去掉两机全部 MTP 标志, 跑纯 layer-pipeline。
+  - NO_MTP=1 能生成 → bug = MTP 污染 worker output head (真因, 进一步查 buffer 重叠映射)。
+  - NO_MTP=1 仍 0 token → bug = layer-pipeline 末位 logits 回传本身。
+**未运行** (守 memory-safety gate, 等用户确认。看门狗 14G 在位)。
+
+---
+
+## 2026-05-31 (续2) — generation:0.00 深挖: 代码路径全对, 需实测 logits 定位
+
+**确认走的是哪条路径。** `./ds4 --role coordinator -p` 走 ds4_distributed.c:3972
+`dist_run_coordinator_generation` (自包含 tokenize/prefill/decode), 非 CLI 循环。其解码循环
+(4141-4149): 首 token 采样自 prefill 填的 `logits`, `==eos` 即 break。**此路径完全不调 MTP 投机**
+(纯自回归 4162)。所以 generated=0 ⟺ prefill logits argmax = EOS。
+
+**代码路径逐段核对, 结构全对:**
+- 冷启动 → dist_coordinator_prefill_prompt (3888) → dist_coordinator_eval_span (2794)。
+- coordinator: ds4_session_eval_layer_slice(local 0:26, output_hc=hidden, output_logits=false)
+  → batch prefill (ds4.c:19959+), 读 g->batch_cur_hc 全 n_tokens 行进 hidden (20005)。✓
+- worker: 写 input_hc→batch_cur_hc, 跑 27:42, output head 取 row n_tokens-1 → g->logits (19989-19998)。✓
+- s->logits 与 ds4_session_sample 同 buffer (ds4.c:20268)。✓
+- activation_bits 默认 32 (FP32 全精度, 非有损)。✓ enable_mtp 不改主 output head 路径。✓
+结论: 纯读代码无法再定位; bug 在 Metal 内核细节 / 残留预算下 buffer 别名 / 或模型真吐 EOS。
+**必须实测 logits。**
+
+**现实障碍 (记下)。** 单机 k4 基线现在也 OOM: M4 PhysMem 13G 被其他 app 占用(非 ds4, 无残留进程),
+仅 2.5G 空闲; 单机 k4 需 ~10G。⟹ 这不是 bug, 是宿主机内存被占。要跑单机基线需先腾出 ~8-10G。
+
+**下一步候选 (待用户定):**
+  A. 腾 RAM → 单机 k4 `--dump-logprobs` 基线 (最快, 确认正确首 token; 若单机也 EOS = prompt/模板问题非分布式)。
+  B. 给 coordinator 加 `--dump-logprobs` 跑双机(带MTP) → scp 回 → 比对 top-20。直接看分布式 logits 是否乱。
+  金标准 = A+B diff。两者都需用户动作/资源, 守 memory-safety gate 不自动跑。
+
+---
+
+## 2026-05-31 (续3) — 用户更正拓扑: 本机 M4 扛大部分层, M1 扛 MTP+少部分层 (脚本翻转重写)
+
+**用户明确目标 (推翻之前的切分方向)。** 不是 M1 扛大头, 而是: 本机 M4 = 大部分层; M1 = MTP + 少部分
+末段层。且"不管以前的 connect bug, 直接让脚本按此拓扑跑"。
+
+**拓扑翻转 (角色+位置都换):**
+  - 本机 M4 = coordinator (--listen 192.168.1.3:5599), 持 0:32 (33 层, 大部分) + token_embd,
+    tokenize/sample, 跑 -p 一次性生成 (本机直接打印, 不再 ssh 读回)。
+  - M1 = worker (--coordinator 192.168.1.3 5599 → 连本机), 持 33:output (10 层, 少部分) +
+    output head + MTP drafter。MTP 必须跟 output head 同机 (mtp_for_worker_draft 硬约束), 故落 M1。
+  - 数据流 M4(embed+0:32) → hidden → M1(33:output+head+MTP) → logits → 回 M4 采样。
+
+**网络: 标准方向, 无需 reverse-connect。** layer-pipeline 唯一跨机 connect = worker→coordinator。
+本拓扑 worker=M1 出站连本机 M4 (走标准方向)。证实 reverse-connect 只对 tp_enabled 生效
+(ds4.c:19515-19529), layer-pipeline 不支持 —— 但本拓扑不需要它。
+
+**事实核对。** 本机 M4 bridge0 = 192.168.1.3 (与 M1 192.168.1.2 同段, M1 可达)。M1 上 k4 + MTP
+两 gguf 均在。前置检查改为 ssh 验 M1 上的 MODEL+MTP_GGUF。
+
+**脚本改动 (tools/mtp_pipe_k4_speed.sh 整体重写):** coordinator 改在本机跑(原在 M1); worker 改在
+M1 跑(原在本机); COORD_IP 192.168.1.2→192.168.1.3; 看门狗本机=coordinator/M1=worker; 结果直接
+读本机日志。保留 NO_MTP 隔离开关、两边 clean+make、看门狗两边同杀。bash -n 通过。**未运行**。
+
+**遗留未解。** generation:0.00 (首-token-EOS) 的真因尚未定位 (代码路径全对, 需实测 logits)。新拓扑
+是否仍 EOS 未知 —— 若仍 EOS, 说明与哪台机器当 coordinator 无关, 是 layer-pipeline logits 本身,
+届时拿 --dump-logprobs 实测。**风险: 本机 M4 现扛大部分层 ~8.4G, 而 M4 当前被其他 app 占 13G,
+GPU 工作集会 OOM —— 用户需先腾内存 (单机 k4 同因 OOM 已证)。**
+
+---
+
+## 2026-05-31 (续4) — 翻转拓扑后 worker 连不上: 真因 = macOS 本地网络隐私 (非网络/非代码)
+
+**症状.** 翻转拓扑 (M4=coordinator listen 192.168.1.3, M1=worker connect) 后: coordinator 卡
+"missing layer 33"; M1 worker 日志刷 `unable to connect to 192.168.1.3:5599: No route to host`。
+
+**逐层排除 (全部实测):**
+- M1→M4: ping 通, `nc 192.168.1.3 5599` 通, 路由表 interface=bridge0。⟹ 网络好的。
+- ds4 connect debug (DS4_TP_CONNECT_DEBUG=1): try family=IPv4 dst=192.168.1.3:5599 → errno=No route to host。
+- DS4_TP_SRC_IP=192.168.1.2 绑源: 仍 EHOSTUNREACH。nc -s 192.168.1.2 却通 ⟹ 非 bind 问题。
+- C 复现器 (/tmp/cx, /tmp/cx2) 逐字复刻 dist_connect_endpoint_once (getaddrinfo+socket+全部
+  socket option mask=31+IPPROTO_TCP): **全部 connect OK**。同一时刻 ds4 仍挂 ⟹ ds4 二进制特有。
+- IP_BOUND_IF en0=Connection refused, bridge0=OK ⟹ 非出接口选择。
+
+**真因 (M1 system log 铁证):**
+  `ds4: (Network) libinfo check path: unsatisfied (Local network prohibited), interface: bridge0`
+  = macOS Local Network Privacy 禁止 ds4 二进制走 bridge0 本地链路。按 cdhash 授权; 脚本
+  `make clean && make ds4` 每次换新二进制 → 授权重置; ssh 无头启动无法弹授权框 → 永远被拒。
+  nc/cx 有权限故通。非网络、非 ds4 代码 bug。
+
+**修复方向 (待定):**
+  1. 即时: M1 GUI System Settings → Privacy & Security → Local Network → 开启 ds4 (或 Terminal)。
+     缺点: 每次 rebuild 换 cdhash 又被重置。
+  2. durable headless: 给 layer-pipeline 加 reverse-connect → M1 只 listen/accept (inbound 不需
+     此权限), M4 (可交互授权) 全部出站。一举解决 (且正好是用户要的 M4 大层/M1 MTP 布局)。
+  3. 或对 ds4 用稳定签名身份 codesign + 授权一次 (跨 rebuild 保持)。
+**当前 debug worker (pid 63067) 仍在 M1 重试; coordinator(本机 pid 99691) 仍 listen。需清理。**
+
+---
+
+## 2026-05-31 (续5) — 实现 layer-pipeline reverse-connect (修本地网络权限拦截, 一劳永逸)
+
+**为什么需要 (不是端口/网络问题).** M1 网络/端口都正常 (nc/ping/C复现器全通); 唯独 ds4 这个二进制被
+macOS Local Network Privacy 拒绝从 bridge0 出站 (按 cdhash 授权, rebuild 重置, ssh 无头无法弹框)。
+两机各自端口都明确, 普通"一个连另一个"本该 trivial —— 复杂仅来自这个 OS 拦截。两条出路: M1 GUI
+授权(每次 rebuild 失效) 或 让 M1 永不出站(reverse-connect)。用户选后者(一劳永逸)。
+
+**改动 (聚焦: 只翻控制通道方向; 数据通道本就是 coordinator→worker, 不动).**
+- dist_run_worker (ds4_dist_run→worker 入口): reverse 时开 control listener(opt->listen_port) +
+  data listener(自动端口), accept coordinator → 发 HELLO → read loop。worker 零出站。
+- ds4_dist_session_create (CLI -p 的 coordinator 真实路径): reverse 时不 listen, 起
+  dist_coordinator_reverse_connect_main 线程 dial worker(opt->coordinator_host:port) → 建 ctx
+  (peer 用 getpeername, 数据通道地址天然正确) → inline 跑 dist_coordinator_client_main。
+- dist_validate_options: 加 dist_rev (非 TP 的 reverse), coordinator 用 --coordinator / worker 用
+  --listen。listen_fd 在 reverse 下钉 -1 (calloc 默认 0 会误关 stdin)。线程查 state->shutting_down 退出。
+- 开关: DS4_DIST_REVERSE_CONNECT=1 (兼容 DS4_TP_REVERSE_CONNECT)。
+
+**验证.** make 全绿 (ds4/server/agent 都链接 ds4_distributed.o)。运行自检: reverse coordinator 打印
+"reverse-connect dialing worker 127.0.0.1:5604" 并主动拨(无 listener 时 Connection refused 重试) ✓;
+forward 无 env 仍 "listening on 127.0.0.1:5605" ✓ (字节行为不变)。worker reverse 路径与 forward 对称,
+编译过, 端到端待双机脚本验证 (M4 内存被占, 本地 loopback 双载放不下)。
+
+**脚本 tools/mtp_pipe_k4_speed.sh** 已配 reverse: M1 worker --listen 192.168.1.2 5599 先起;
+M4 coordinator --coordinator 192.168.1.2 5599 后拨; RUN_ENV=DS4_DIST_REVERSE_CONNECT=1。首跑 M4 弹
+本地网络授权框点允许即可 (M4 交互)。M4 扛大部分层 ~8G, 需先腾内存。
+
+## 2026-05-31 双机 layer-pipeline+MTP worker GPU-OOM 真因定位 + chunk 绕过验证
+
+**报障**: tools/mtp_pipe_k4_speed.sh 跑 "本机内存爆了"。
+
+**真因 (加 [diag] 日志后实测, 非臆测)**:
+- 误判纠正: 不是主机 RSS 爆, 也不是 coordinator。是 M1 Pro worker 的 **GPU 命令缓冲 OOM** (kIOGPUCommandBufferCallbackErrorOutOfMemory)。coordinator 的 "prompt processing failed: metal layer-slice failed" 是 worker 回传错误字符串的下游症状。
+- M1 Pro `recommendedMaxWorkingSetSize = 10.67 GiB` (GPU 工作集天花板)。
+- 模型常驻: base 切片(33:output) 24 views 3.33 GiB + MTP 1 view 3.55 GiB = 25 views **6.88 GiB** (两套并入同一 g_model_residency_set)。
+- prefill 命令批执行时 device currentAllocated 暴涨到 **11.23 GiB > 10.67** → 越线 OOM。多出的 ~4.35 GiB 是 prefill scratch 池 (按 prefill_chunk=4096 预分配) + 层批中间张量, 而 prompt 仅 25 token, 几乎全浪费。
+- 旁证: L1 budget gate 原先漏算 MTP (只 gate base 3.33G); 已补一行 gate 让 MTP 3.55G 现形 (ds4.c MTP map 前)。
+
+**实测绕过**: `DS4_METAL_PREFILL_CHUNK=512` → worker 不再 OOM, **coordinator prefill 21.53 t/s 跑通** (过 20 t/s 闸的 prefill)。模型常驻仍 6.88G 不变, 仅 scratch 池缩小。
+
+**遗留**: generation 0.00 t/s / decode_tokens=0 —— prefill 通但解码 0 产出, 两边无报错, 独立问题 (MTP 跨机解码路径), 待查。
+
+**埋点 (本次新增, 暂全程打)**: ds4_metal.m residency 建立后打 wired views/GiB + recommendedMax + currentAllocated; CB 失败处打失败瞬间 currentAllocated vs recommendedMax。ds4.c MTP map 前补 L1 gate。待定: 是否收进 DS4_METAL_DIAG 开关。
+
+**永久修复方向 (未做, 待确认)**: layer-slice worker 的 prefill scratch 按实际 WORK chunk 缩放, 或 distributed worker 默认小 chunk; 对单机/非分布式零影响。
+
+## 2026-05-31 generation=0 定位: k4 退化模型即时 EOS, 非双机 bug
+
+**加 DS4_DECODE_DIAG 日志 (ds4_cli.c 采样循环 + ds4.c ds4_session_sample) 实测**:
+- 双机 coordinator: `[decode-diag] logits argmax=1 val=16.8693 nonfinite=0/129280` + `sample#0 token=1 eos=1 max_tokens=128 mtp_draft=0`。
+  → 首 token = argmax = **1 = EOS**, logits 完全健康 (无 NaN/inf, 强 logit 16.87), 故 ds4_cli.c:597 第一次采样即 break → 0 产出。
+  → mtp_draft=0 证实 coordinator 上 MTP 投机是死代码 (ds4_engine_has_mtp 对 distributed 角色恒 false), 走普通 ds4_session_eval。
+- 单机同 prompt 同 k4 模型也 generation 0.00 t/s (单机走 ds4_engine_generate 路径, 未打 diag, 但同样 0 产出)。
+- 模型加载行: `reduced-expert model: keep-map over 43 layers (min kept 4 of 256)` —— gguf/ds4flash-k4.gguf 是 256 专家只留 4 个的极度裁剪测速骨架, 输出退化, 必即时 EOS。
+
+**结论**: generation=0 不是双机解码 bug。双机管线忠实复现单机 k4 行为 (首 token=EOS)。解码链路正确。
+
+**对测速目标的影响**: k4 退化模型 + 真 prompt 永远第一步 EOS, 测不到 decode t/s。ds4 当前无 --ignore-eos/min-tokens 开关。要测双机 decode 速度需加 --ignore-eos (或 DS4_IGNORE_EOS env) 在 ds4_cli.c:597/633 两处 EOS 判断加门控强制生成 N token。待用户确认是否加。
+
+**遗留埋点**: DS4_DECODE_DIAG (ds4_cli.c + ds4.c), DS4_METAL 残留 [diag] (residency/CB-fail), 均 env 门控/低噪, 待定是否收编进统一 DS4_*_DIAG 开关。

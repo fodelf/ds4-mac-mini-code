@@ -3485,6 +3485,7 @@ static DS4_MAYBE_UNUSED bool weights_model_map_spans(
         uint32_t layer_start,
         uint32_t layer_end,
         bool include_output,
+        bool include_token_embd,
         ds4_model_map_span_vec *spans) {
     if (!w || !spans) return false;
     if (layer_start >= DS4_N_LAYER) return false;
@@ -3492,7 +3493,11 @@ static DS4_MAYBE_UNUSED bool weights_model_map_spans(
     if (layer_end >= DS4_N_LAYER || layer_end < layer_start) return false;
 
     memset(spans, 0, sizeof(*spans));
-    if (layer_start == 0) model_map_span_vec_include_one(spans, w->token_embd);
+    /* Layer-0 workers always need token_embd to embed the prompt; a distributed
+     * MTP drafter on a nonzero-start worker needs it too (mtp.md Phase 1). */
+    if (layer_start == 0 || include_token_embd) {
+        model_map_span_vec_include_one(spans, w->token_embd);
+    }
     for (uint32_t il = layer_start; il <= layer_end; il++) {
         model_map_span_vec_include_layer(spans, &w->layer[il]);
     }
@@ -17792,6 +17797,14 @@ int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
     return ds4_engine_has_mtp(e) ? e->mtp_draft_tokens : 0;
 }
 
+/* mtp.md Phase 1: the configured draft width regardless of whether this engine
+ * loaded the MTP model. The distributed coordinator orchestrates speculation but
+ * does not load MTP itself (the drafter lives on the last-layer worker), so it
+ * needs the raw --mtp-draft value to size the candidate batch. */
+int ds4_engine_mtp_draft_tokens_configured(ds4_engine *e) {
+    return e ? e->mtp_draft_tokens : 0;
+}
+
 const ds4_tokens *ds4_session_tokens(ds4_session *s) {
     return s ? &s->checkpoint : NULL;
 }
@@ -19149,6 +19162,14 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         load_output = opt->distributed.layers.has_output ||
                       opt->distributed.role == DS4_DISTRIBUTED_COORDINATOR;
     }
+    /* mtp.md Phase 1 (Scheme A): the MTP drafter runs on the worker holding the
+     * final layers + output head. That worker loads the MTP support model and,
+     * unlike other layer-slice workers, must also keep token_embd resident (the
+     * MTP head re-embeds its own draft tokens from the base token_embd). */
+    const bool mtp_for_worker_draft =
+        opt->distributed.role == DS4_DISTRIBUTED_WORKER &&
+        opt->distributed.mtp_draft_on_worker &&
+        load_output;
 
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
     ds4_profile_load_begin();
@@ -19167,13 +19188,14 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         return 1;
     }
     if (opt->mtp_path && opt->mtp_path[0] &&
-        opt->distributed.role == DS4_DISTRIBUTED_NONE) {
+        (opt->distributed.role == DS4_DISTRIBUTED_NONE || mtp_for_worker_draft)) {
         model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
         mtp_weights_bind(&e->mtp_weights, &e->mtp_model);
         e->mtp_ready = true;
-        fprintf(stderr, "ds4: MTP support model loaded: %s (draft=%d)\n",
+        fprintf(stderr, "ds4: MTP support model loaded: %s (draft=%d%s)\n",
                 opt->mtp_path,
-                e->mtp_draft_tokens);
+                e->mtp_draft_tokens,
+                mtp_for_worker_draft ? ", distributed worker drafter" : "");
     }
 
 #ifndef DS4_NO_GPU
@@ -19220,6 +19242,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                                          load_layer_start,
                                          load_layer_end,
                                          load_output,
+                                         mtp_for_worker_draft,
                                          &spans))
             {
                 fprintf(stderr, "ds4: invalid model load layer slice %u:%s\n",
@@ -19337,6 +19360,12 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             ds4_engine_close(e);
             *out = NULL;
             return 1;
+        }
+        /* The base model map already passed the L1 gate above, but the MTP draft
+         * model adds its own resident span that was previously unaccounted for.
+         * Surface it so the planned-resident footprint reflects base+MTP. */
+        if (e->mtp_ready) {
+            ds4_l1_budget_gate(e->mtp_model.size - e->mtp_model.tensor_data_pos, 0);
         }
         if (e->mtp_ready &&
             !ds4_gpu_set_model_map_range(e->mtp_model.map,
@@ -19999,6 +20028,202 @@ int ds4_session_eval_layer_slice(ds4_session *s,
 #endif
 }
 
+/* mtp.md Phase 1 (Scheme A): produce up to `max_k` greedy MTP draft tokens on the
+ * worker that just evaluated the final layer slice. The slice eval leaves the
+ * model's final hidden state in g->cur_hc, which is exactly the input the MTP
+ * head consumes, so no hidden-state round trip to the coordinator is needed.
+ *
+ * `verified_token` is the token the coordinator already committed at `pos`
+ * (the slice's last token); the recursion drafts verified_token -> draft[0] ->
+ * draft[1] -> ... Returns 0 with *out_n=0 (not an error) when MTP is unavailable
+ * so callers can fall back to plain decode. Greedy-only, matching the
+ * single-machine speculative path. The speculative rows written into the MTP
+ * raw cache are rolled back later via the WORK accept_len (increment #4). */
+int ds4_session_mtp_draft(ds4_session *s,
+                          int verified_token,
+                          uint32_t pos,
+                          int max_k,
+                          int *drafts,
+                          int *out_n,
+                          char *err,
+                          size_t errlen) {
+    if (out_n) *out_n = 0;
+    if (!s || !s->engine || !drafts || max_k <= 0) return 0;
+    ds4_engine *e = s->engine;
+    if (!e->mtp_ready || !ds4_backend_uses_graph(e->backend)) return 0;
+#ifdef DS4_NO_GPU
+    (void)verified_token; (void)pos; (void)err; (void)errlen;
+    return 0;
+#else
+    ds4_gpu_graph *g = &s->graph;
+    if (!g->mtp_raw_cache) return 0;
+    if (max_k > e->mtp_draft_tokens) max_k = e->mtp_draft_tokens;
+    if (max_k > 16) max_k = 16;
+    if (max_k <= 0) return 0;
+
+    int n = 0;
+    int top = -1;
+    if (!metal_graph_eval_mtp_draft(g, &e->model, &e->weights,
+                                    &e->mtp_model, &e->mtp_weights,
+                                    verified_token, pos, NULL, &top)) {
+        if (errlen) snprintf(err, errlen, "MTP draft step 0 failed");
+        return 1;
+    }
+    drafts[n++] = top;
+    for (; n < max_k; n++) {
+        /* Ping-pong the two MTP hidden buffers exactly as the single-machine
+         * recursive drafter does: step 0 wrote g->mtp_state_hc, so an odd step
+         * reads it and writes g->mtp_next_hc, and an even step does the reverse. */
+        ds4_gpu_tensor *prev_hc = (n & 1) ? g->mtp_state_hc : g->mtp_next_hc;
+        ds4_gpu_tensor *out_hc  = (n & 1) ? g->mtp_next_hc  : g->mtp_state_hc;
+        top = -1;
+        if (!metal_graph_eval_mtp_draft_from_hc(g, &e->model, &e->weights,
+                                                &e->mtp_model, &e->mtp_weights,
+                                                prev_hc, out_hc,
+                                                drafts[n - 1],
+                                                pos + (uint32_t)n,
+                                                NULL, &top)) {
+            break; /* keep the drafts gathered so far */
+        }
+        drafts[n] = top;
+    }
+    if (out_n) *out_n = n;
+    return 0;
+#endif
+}
+
+/* mtp.md Phase 1 (Scheme A) cross-machine verifier: run a K-token candidate
+ * batch through this worker's layer slice (layer_start..layer_end, which must be
+ * the final transformer layer) and emit the per-row logits into
+ * row_logits[i*vocab .. ]. This is the batch verification pass (mtp.md §3.2.2,
+ * "末端出 K 组 logits"): row i predicts batch position i+1, so the coordinator
+ * argmaxes each row to find the accepted speculative prefix and reuses the
+ * boundary row to seed the next sampling step. The batch writes layer KV for
+ * positions pos0..pos0+n_tokens-1 and commits all n_tokens to the timeline; the
+ * rejected tail is rolled back afterward by truncating the timeline
+ * (ds4_session_layer_slice_rollback) so the stale ring rows are overwritten on
+ * the next eval. */
+int ds4_session_verify_batch_argmax(ds4_session *s,
+                                    const int *tokens,
+                                    uint32_t n_tokens,
+                                    uint32_t pos0,
+                                    uint32_t layer_start,
+                                    uint32_t layer_end,
+                                    const float *input_hc,
+                                    float *row_logits,
+                                    char *err,
+                                    size_t errlen) {
+    if (!s || !s->engine || !tokens || !row_logits || n_tokens == 0) {
+        if (errlen) snprintf(err, errlen, "invalid verify batch request");
+        return 1;
+    }
+    if (layer_end + 1u != (uint32_t)DS4_N_LAYER) {
+        if (errlen) snprintf(err, errlen, "verify batch requires the final transformer layer");
+        return 1;
+    }
+    if (layer_start != 0 && !input_hc) {
+        if (errlen) snprintf(err, errlen, "verify batch on a nonzero layer needs input hidden-state");
+        return 1;
+    }
+    if (ds4_session_slice_check_timeline(s, tokens, n_tokens, pos0, err, errlen) != 0) {
+        return 1;
+    }
+#ifdef DS4_NO_GPU
+    (void)pos0; (void)layer_start;
+    if (errlen) snprintf(err, errlen, "GPU support is not compiled in");
+    return 1;
+#else
+    ds4_engine *e = s->engine;
+    ds4_gpu_graph *g = &s->graph;
+    if (!g->spec_logits) {
+        if (errlen) snprintf(err, errlen, "verify batch needs the MTP spec-logits buffer");
+        return 1;
+    }
+    if (n_tokens > s->prefill_cap) {
+        if (errlen) snprintf(err, errlen, "verify batch %u exceeds prefill cap %u",
+                             n_tokens, s->prefill_cap);
+        return 1;
+    }
+
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t hc_bytes = (uint64_t)n_tokens * hc_dim * sizeof(float);
+    ds4_tokens span = { .v = (int *)tokens, .len = (int)n_tokens, .cap = (int)n_tokens };
+
+    bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, &span, 0, n_tokens);
+    if (ok && input_hc) {
+        ok = ds4_gpu_tensor_write(g->batch_cur_hc, 0, input_hc, hc_bytes) != 0;
+    } else if (ok) {
+        ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
+                                                     g->prefill_tokens,
+                                                     &e->model,
+                                                     &e->weights,
+                                                     &span,
+                                                     0,
+                                                     n_tokens);
+    }
+    if (ok) ok = ds4_gpu_begin_commands() != 0;
+    for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
+        ok = metal_graph_encode_layer_batch(g, &e->model, &e->weights.layer[il],
+                                            il, pos0, n_tokens);
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    if (!ok) {
+        if (errlen) snprintf(err, errlen, "%s verify batch layers failed",
+                             ds4_backend_name(e->backend));
+        s->checkpoint_valid = false;
+        return 1;
+    }
+
+    /* Output head on all n_tokens rows -> spec_logits, read back K logit rows. */
+    ok = ds4_gpu_begin_commands() != 0;
+    if (ok) ok = metal_graph_encode_output_head_batch(g, &e->model, &e->weights,
+                                                      n_tokens, e->weights.output->dim[1]);
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    if (ok) {
+        ok = ds4_gpu_tensor_read(g->spec_logits, 0, row_logits,
+                                 (uint64_t)n_tokens * DS4_N_VOCAB * sizeof(row_logits[0])) != 0;
+    }
+    if (!ok) {
+        if (errlen) snprintf(err, errlen, "%s verify batch output head failed",
+                             ds4_backend_name(e->backend));
+        s->checkpoint_valid = false;
+        return 1;
+    }
+    /* Commit all K candidate tokens to the timeline so checkpoint.len advances by
+     * n_tokens (KV rows pos0..pos0+n_tokens-1 are live). The rejected tail is
+     * trimmed afterward via ds4_session_layer_slice_rollback. */
+    ds4_session_slice_commit_timeline(s, tokens, n_tokens);
+    return 0;
+#endif
+}
+
+/* mtp.md Phase 1: truncate the layer-slice timeline back to new_len positions
+ * after a speculative batch so the rejected tail is dropped. The position-indexed
+ * KV ring rows are not cleared; the next eval at new_len overwrites them, exactly
+ * like the single-machine MTP rollback. */
+int ds4_session_layer_slice_rollback(ds4_session *s, uint32_t new_len,
+                                     char *err, size_t errlen) {
+    if (!s) {
+        if (errlen) snprintf(err, errlen, "missing layer-slice session");
+        return 1;
+    }
+    if (!s->checkpoint_valid || (uint32_t)s->checkpoint.len < new_len) {
+        if (errlen) snprintf(err, errlen, "layer-slice rollback target %u exceeds timeline %d",
+                             new_len, s->checkpoint.len);
+        return 1;
+    }
+    s->checkpoint.len = (int)new_len;
+    s->mtp_draft_valid = false;
+    return 0;
+}
+
+uint32_t ds4_session_layer_slice_len(const ds4_session *s) {
+    if (!s || !s->checkpoint_valid || s->checkpoint.len < 0) return 0;
+    return (uint32_t)s->checkpoint.len;
+}
+
 #ifndef DS4_NO_GPU
 typedef struct {
     ds4_session *session;
@@ -20303,6 +20528,22 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
 }
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
+    if (getenv("DS4_DECODE_DIAG")) {
+        /* [decode-diag] inspect the logits the sampler is about to draw from:
+         * argmax + its value + how many entries are non-finite (NaN/inf => the
+         * distributed worker returned garbage logits rather than a real head). */
+        int argmax = 0;
+        float amv = s->logits[0];
+        uint32_t nonfinite = 0;
+        for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+            const float v = s->logits[i];
+            if (!isfinite(v)) { nonfinite++; continue; }
+            if (v > amv) { amv = v; argmax = (int)i; }
+        }
+        fprintf(stderr,
+                "ds4: [decode-diag] logits argmax=%d val=%.4f nonfinite=%u/%u\n",
+                argmax, amv, nonfinite, (unsigned)DS4_N_VOCAB);
+    }
     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k, top_p, min_p, rng);
 }
 
@@ -20490,9 +20731,20 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     if (!s || max_tokens <= 0 || accepted_cap <= 0) return 0;
     if (s->distributed) {
         if (!accepted) return 0;
-        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
-        accepted[0] = first_token;
-        return 1;
+        if (!s->checkpoint_valid) {
+            if (errlen) snprintf(err, errlen, "distributed decode requires a valid checkpoint");
+            return -1;
+        }
+        /* mtp.md Phase 1: cross-machine MTP speculation. The driver commits
+         * first_token + verified drafts into the session checkpoint and returns
+         * the committed count; s->logits is left predicting the next token. */
+        int cap = accepted_cap < max_tokens ? accepted_cap : max_tokens;
+        int n = ds4_dist_session_eval_speculative(s->distributed, s, &s->checkpoint,
+                                                  first_token, eos_token,
+                                                  accepted, cap, s->logits,
+                                                  err, errlen);
+        if (n < 0) { s->checkpoint_valid = false; return -1; }
+        return n;
     }
     if (ds4_session_is_cpu(s)) {
         (void)max_tokens;

@@ -27,12 +27,21 @@ MODEL=${MODEL:-gguf/ds4flash-k4.gguf}
 CTX=${CTX:-32}
 NPRED=${NPRED:-16}
 PROMPT=${PROMPT:-hi}
-TP_LAYERS=${TP_LAYERS:-3}
-LOCAL_MAX_GB=${LOCAL_MAX_GB:-12}
-REMOTE_MAX_GB=${REMOTE_MAX_GB:-12}             # k4 backbone 8.2G, 需 >8.2
+# TP_LAYERS = 前多少层做 element-split + 跨机 all-reduce。对能整个进单机 RAM 的 k4,
+# 每个 tp-layer 都是纯屏障税 (两机冗余算同样的 attn/dense/shared, 只切占比很小的 routed 专家),
+# 层数越多越慢。要逼近单机速度就调小; =1 是最小屏障 (1 跨机会合/token)。
+TP_LAYERS=${TP_LAYERS:-1}
+# offload 关掉后 k4 整模型常驻 ~10-11G (= 单机已在安全跑的足迹, 单机 10+ t/s 即证明 resident
+# k4 进得了 16G)。看门狗给 14G: 既不误杀合法常驻, 又留 2G 给 OS、不怼物理红线。
+LOCAL_MAX_GB=${LOCAL_MAX_GB:-14}
+REMOTE_MAX_GB=${REMOTE_MAX_GB:-14}             # k4 resident ~10-11G, 需 >11
 LOCAL_BUDGET_MB=${LOCAL_BUDGET_MB:-13500}      # L1-gate planned-resident 预算 (与看门狗解耦)
 REMOTE_BUDGET_MB=${REMOTE_BUDGET_MB:-13500}
-RUN_ENV=${RUN_ENV:-"DS4_TP_REVERSE_CONNECT=1 DS4_METAL_EXPERT_OFFLOAD=1 DS4_METAL_NO_RESIDENCY=1"}
+# k4 (8.2G backbone) 整个进 16G RAM, 不需要 expert-offload。强开 OFFLOAD+NO_RESIDENCY
+# (当初为 82GB 全模型留的) 会让每次 TP flush 的新 CB 重新 wire 模型页, 把屏障税放大几十倍
+# → 这是双机 3 t/s 的主因, 不是 TP。k4 默认只留 reverse-connect, 让模型常驻、屏障廉价。
+# 跑 82GB 全模型时再 env 覆盖加回: RUN_ENV="... DS4_METAL_EXPERT_OFFLOAD=1 DS4_METAL_NO_RESIDENCY=1"
+RUN_ENV=${RUN_ENV:-"DS4_TP_REVERSE_CONNECT=1"}
 
 LEADER_LOG=/tmp/tp_k4_leader.log
 FOLLOWER_LOG=/tmp/tp_k4_follower.log

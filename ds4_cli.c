@@ -594,6 +594,12 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     while (generated < max_tokens && !cli_interrupt_requested()) {
         int token = ds4_session_sample(session, cfg->gen.temperature, 0,
                                        cfg->gen.top_p, cfg->gen.min_p, &rng);
+        if (getenv("DS4_DECODE_DIAG")) {
+            fprintf(stderr,
+                    "ds4: [decode-diag] sample#%d token=%d eos=%d max_tokens=%d mtp_draft=%d\n",
+                    generated, token, ds4_token_eos(engine), max_tokens,
+                    ds4_engine_mtp_draft_tokens(engine));
+        }
         if (token == ds4_token_eos(engine)) break;
 
         int toks[17];

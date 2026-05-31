@@ -93,6 +93,12 @@ typedef struct {
      * existing role/listen/coordinator host:port fields select who listens. */
     bool tp_enabled;
     uint32_t tp_layers;
+    /* mtp.md Phase 1 (Scheme A): run the MTP drafter on the worker that holds
+     * the final transformer layers + output head. The MTP head consumes the
+     * model's final hidden state, which that worker already produces, so it can
+     * draft K future tokens without shipping the hidden back to the coordinator.
+     * Set by `--mtp-role worker`; ignored unless an --mtp model is loaded. */
+    bool mtp_draft_on_worker;
 } ds4_distributed_options;
 
 typedef struct {
@@ -262,6 +268,9 @@ int ds4_session_prefill_cap(ds4_session *s);
 int ds4_engine_routed_quant_bits(ds4_engine *e);
 bool ds4_engine_has_mtp(ds4_engine *e);
 int ds4_engine_mtp_draft_tokens(ds4_engine *e);
+/* Configured --mtp-draft width, ungated by MTP-model presence (the distributed
+ * coordinator needs this to size the speculative batch without loading MTP). */
+int ds4_engine_mtp_draft_tokens_configured(ds4_engine *e);
 const ds4_tokens *ds4_session_tokens(ds4_session *s);
 
 /* Low-level graph slice entry points used by distributed inference.  The
@@ -285,6 +294,38 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
                                          float *logits,
                                          char *err,
                                          size_t errlen);
+/* mtp.md Phase 1: draft up to max_k greedy MTP tokens from the final hidden
+ * state left in the graph by the last ds4_session_eval_layer_slice() call.
+ * Writes the draft token ids into drafts[0..*out_n-1]. Returns 0 with *out_n=0
+ * when MTP is unavailable (caller falls back to plain decode), 0 with *out_n>0
+ * on success, nonzero only on a hard backend failure. */
+int ds4_session_mtp_draft(ds4_session *s,
+                          int verified_token,
+                          uint32_t pos,
+                          int max_k,
+                          int *drafts,
+                          int *out_n,
+                          char *err,
+                          size_t errlen);
+/* mtp.md Phase 1 cross-machine verifier: run a K-token candidate batch through
+ * the final-layer worker slice and emit per-row greedy argmax into
+ * row_tops[0..n_tokens-1]. Writes layer KV for pos0..pos0+n_tokens-1 without
+ * committing the timeline (caller commits accepted prefix + rolls back the rest). */
+int ds4_session_verify_batch_argmax(ds4_session *s,
+                                    const int *tokens,
+                                    uint32_t n_tokens,
+                                    uint32_t pos0,
+                                    uint32_t layer_start,
+                                    uint32_t layer_end,
+                                    const float *input_hc,
+                                    float *row_logits,
+                                    char *err,
+                                    size_t errlen);
+/* Truncate the layer-slice timeline to new_len after a speculative batch; query
+ * the current committed length. */
+int ds4_session_layer_slice_rollback(ds4_session *s, uint32_t new_len,
+                                     char *err, size_t errlen);
+uint32_t ds4_session_layer_slice_len(const ds4_session *s);
 
 /* Disk KV payload helpers.  HTTP/agent code owns the outer file header and
  * persistence policy; the engine owns the DS4-specific serialized graph state. */

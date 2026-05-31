@@ -286,6 +286,15 @@ static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *labe
     if (cb.status == MTLCommandBufferStatusError) {
         fprintf(stderr, "ds4: Metal %s failed: %s\n",
                 label, [[cb.error localizedDescription] UTF8String]);
+        /* [diag] at the moment of failure, is the GPU working set over the
+         * device ceiling? currentAllocated > recommendedMax => wired-set OOM. */
+        fprintf(stderr,
+                "ds4: [diag] CB '%s' failure: device currentAllocated %.2f GiB, "
+                "recommendedMax %.2f GiB, residency wired %llu views\n",
+                label,
+                (double)[g_device currentAllocatedSize] / (1024.0 * 1024.0 * 1024.0),
+                (double)[g_device recommendedMaxWorkingSetSize] / (1024.0 * 1024.0 * 1024.0),
+                (unsigned long long)g_model_residency_count);
         return 0;
     }
     return 1;
@@ -458,16 +467,28 @@ static int ds4_gpu_model_residency_request_views(void) {
         }
 
         uint32_t resident_views = 0;
+        uint64_t resident_bytes = 0;
         for (uint32_t i = 0; i < g_model_view_count; i++) {
             /* Non-resident views (routed-expert offload) are wrapped but kept out
              * of the residency set so their clean pages stay reclaimable. */
             if (!g_model_views[i].resident_hint) continue;
             [g_model_residency_set addAllocation:g_model_views[i].buffer];
             resident_views++;
+            resident_bytes += g_model_views[i].bytes;
         }
         [g_model_residency_set commit];
         [g_model_residency_set requestResidency];
         g_model_residency_count = resident_views;
+        /* [diag] surface the actual wired working set vs the GPU ceiling. This
+         * fires once per model map (base slice, then again after MTP appends its
+         * views), so the second line shows the cumulative base+MTP residency. */
+        fprintf(stderr,
+                "ds4: [diag] residency set: %u/%u views wired, %.2f GiB; "
+                "device recommendedMax %.2f GiB, currentAllocated %.2f GiB\n",
+                resident_views, g_model_view_count,
+                (double)resident_bytes / (1024.0 * 1024.0 * 1024.0),
+                (double)[g_device recommendedMaxWorkingSetSize] / (1024.0 * 1024.0 * 1024.0),
+                (double)[g_device currentAllocatedSize] / (1024.0 * 1024.0 * 1024.0));
     }
 #endif
 
