@@ -39,10 +39,25 @@ int ds4_gpu_flush_commands(void);
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
 
+/* Tensor-parallel rendezvous. ds4_gpu_tp_signal_after_batch encodes a shared-
+ * event signal at the tail of the current batch and returns the value to wait on
+ * (0 on error); the caller flushes the batch so the GPU runs and fires it.
+ * ds4_gpu_tp_host_wait blocks on the fast MTLSharedEvent path until that value,
+ * making the just-encoded results host-visible without a full pipeline drain. */
+uint64_t ds4_gpu_tp_signal_after_batch(void);
+int ds4_gpu_tp_host_wait(uint64_t value);
+
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
 int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, uint32_t count, uint64_t max_tensor_bytes);
+/* Reduced-memory model loader. Identical to ds4_gpu_set_model_map_spans but each
+ * span carries a resident flag: resident spans (backbone) are wired into the GPU
+ * residency set; non-resident spans (routed experts) are still wrapped so the hot
+ * path can resolve their buffers, but are kept out of the residency set so their
+ * clean file-backed pages stay reclaimable under memory pressure. resident_flags
+ * must be non-NULL with one entry per span. Used for DS4_METAL_EXPERT_OFFLOAD. */
+int ds4_gpu_set_model_map_spans_split(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, const bool *resident_flags, uint32_t count, uint64_t max_tensor_bytes);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes);
@@ -604,6 +619,22 @@ int ds4_gpu_directional_steering_project_tensor(
         uint32_t                width,
         uint32_t                rows,
         float                   scale);
+
+/* Reduced-expert (keep-map) routing support. A shrunken model's expert tensors
+ * only carry the kept rows, but the router still selects in the full 256-wide
+ * original id space. ds4_gpu_set_expert_keep_lut() uploads the per-layer
+ * original-id -> compact-slot table (n_layer * 256 int16, -1 == dropped) into a
+ * small resident GPU buffer once at load. ds4_gpu_translate_expert_ids() rewrites
+ * a `selected` tensor from original ids to compact slots in place, between router
+ * selection and the routed-MoE matvec. Both are no-ops for a full model (no LUT
+ * set). Returns 1 on success, 0 on failure. */
+int ds4_gpu_set_expert_keep_lut(const int16_t *lut, uint32_t n_layer);
+int ds4_gpu_translate_expert_ids(
+        ds4_gpu_tensor       *selected,
+        uint32_t                layer,
+        uint32_t                n_expert_used,
+        uint32_t                n_tokens,
+        uint32_t                n_total_expert);
 
 int ds4_gpu_router_select_tensor(
         ds4_gpu_tensor       *selected,

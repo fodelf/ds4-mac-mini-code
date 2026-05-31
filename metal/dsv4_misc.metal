@@ -218,6 +218,40 @@ kernel void kernel_dsv4_router_weights_one(
     w[tid] = p[s[tid]] / sum * 1.5f;
 }
 
+// Reduced-expert routing id translation for a shrunken (keep-map) model.
+//
+// The router selects experts using the full 256-wide original id space, but a
+// shrunken model's expert tensors only carry the kept rows. This rewrites each
+// selected id in-place from its original id to the compact slot in the kept
+// tensors, using a per-layer 256-entry lookup table (orig id -> slot, -1 if the
+// expert was dropped). Dropped experts fall back to slot 0 so the matvec never
+// indexes out of bounds (the routed weight on a dropped expert is small; smoke
+// quality is not the goal here). One thread per (token, used-slot); a full model
+// never dispatches this kernel (no keep-map -> no-op at the host).
+struct ds4_metal_args_dsv4_route_translate {
+    uint32_t layer;            // which 256-entry LUT row to use
+    uint32_t n_expert_used;    // entries per token in `selected` (== 6)
+    uint32_t n_tokens;
+    uint32_t n_total_expert;   // kept expert count for this layer (clamp upper bound)
+};
+
+kernel void kernel_dsv4_route_translate(
+        constant ds4_metal_args_dsv4_route_translate & args,
+        device const int16_t *lut,      // [n_layer * 256]
+        device       int32_t *selected, // [n_tokens * n_expert_used], rewritten in place
+        uint gid [[thread_position_in_grid]]) {
+    const uint total = args.n_tokens * args.n_expert_used;
+    if (gid >= total) return;
+
+    device const int16_t *row = lut + (uint64_t)args.layer * 256u;
+    const int32_t orig = selected[gid];
+    int32_t slot = (orig >= 0 && orig < 256) ? (int32_t)row[orig] : -1;
+    if (slot < 0 || slot >= (int32_t)args.n_total_expert) {
+        slot = 0;               // dropped/out-of-range expert -> safe slot 0
+    }
+    selected[gid] = slot;
+}
+
 // Decode router selection for one token after the existing
 // sqrt(softplus(logit)) probability kernel has run. Bias affects only top-k
 // selection. Route-weight normalization deliberately stays in the old one-token

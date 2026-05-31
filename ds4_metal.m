@@ -100,6 +100,7 @@ static id<MTLComputePipelineState> g_dsv4_indexed_attention_heads8_rb16_pipeline
 static id<MTLComputePipelineState> g_dsv4_softplus_sqrt_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_finalize_one_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_weights_one_pipeline;
+static id<MTLComputePipelineState> g_dsv4_route_translate_pipeline;
 static id<MTLComputePipelineState> g_dsv4_hc_expand4_pipeline;
 static NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *g_pipeline_cache;
 static NSMutableDictionary<NSString *, id<MTLBuffer>> *g_model_buffer_cache;
@@ -121,6 +122,10 @@ static id<MTLBuffer> g_compressor_store_score_buffer;
 static id<MTLBuffer> g_embed_rows_buffer;
 static id<MTLBuffer> g_router_selection_buffer;
 static id<MTLBuffer> g_router_weight_sum_buffer;
+/* Resident original-id -> compact-slot LUT for reduced-expert models, n_layer*256
+ * int16. nil for a full model (translation kernel never dispatched). */
+static id<MTLBuffer> g_expert_keep_lut_buffer;
+static uint32_t g_expert_keep_lut_layers;
 static id<MTLBuffer> g_indexer_head_scores_buffer;
 static id<MTLBuffer> g_indexer_topk_buffer;
 static id<MTLBuffer> g_indexed_topk_buffer;
@@ -206,6 +211,12 @@ typedef struct {
     uint64_t model_size;
     uint64_t model_offset;
     uint64_t bytes;
+    /* When false, this view is wrapped (so hot-path ds4_gpu_wrap_model_range can
+     * still resolve a buffer for any tensor it covers) but is NOT added to the
+     * model MTLResidencySet. Its file-backed clean pages stay reclaimable under
+     * memory pressure. Used for routed-expert weights under DS4_METAL_EXPERT_OFFLOAD;
+     * every view is resident by default (full-model behaviour unchanged). */
+    bool resident_hint;
 } ds4_gpu_model_view;
 
 static ds4_gpu_model_view g_model_views[DS4_METAL_MAX_MODEL_VIEWS];
@@ -446,12 +457,17 @@ static int ds4_gpu_model_residency_request_views(void) {
             return 0;
         }
 
+        uint32_t resident_views = 0;
         for (uint32_t i = 0; i < g_model_view_count; i++) {
+            /* Non-resident views (routed-expert offload) are wrapped but kept out
+             * of the residency set so their clean pages stay reclaimable. */
+            if (!g_model_views[i].resident_hint) continue;
             [g_model_residency_set addAllocation:g_model_views[i].buffer];
+            resident_views++;
         }
         [g_model_residency_set commit];
         [g_model_residency_set requestResidency];
-        g_model_residency_count = g_model_view_count;
+        g_model_residency_count = resident_views;
     }
 #endif
 
@@ -464,6 +480,7 @@ static int ds4_gpu_add_model_view_range(
         uint64_t    map_offset,
         uint64_t    map_size,
         uint64_t    max_tensor_bytes,
+        bool        resident,
         uint64_t   *mapped_model_size_out) {
     const uint64_t page = (uint64_t)getpagesize();
     const uintptr_t model_addr = (uintptr_t)model_map;
@@ -556,6 +573,7 @@ static int ds4_gpu_add_model_view_range(
         g_model_views[g_model_view_count].model_size = model_size;
         g_model_views[g_model_view_count].model_offset = page_model_offset + off;
         g_model_views[g_model_view_count].bytes = view_bytes;
+        g_model_views[g_model_view_count].resident_hint = resident;
         g_model_view_count++;
 
         g_model_wrap_count++;
@@ -627,6 +645,7 @@ static int ds4_gpu_map_model_views(
                                       map_offset,
                                       map_size,
                                       max_tensor_bytes,
+                                      true,
                                       &mapped_model_size)) {
         return 0;
     }
@@ -4170,6 +4189,8 @@ int ds4_gpu_init(void) {
             ds4_gpu_get_pipeline("kernel_dsv4_router_finalize_one");
         g_dsv4_router_weights_one_pipeline =
             ds4_gpu_get_pipeline("kernel_dsv4_router_weights_one");
+        g_dsv4_route_translate_pipeline =
+            ds4_gpu_get_pipeline("kernel_dsv4_route_translate");
         g_dsv4_hc_expand4_pipeline =
             ds4_gpu_get_pipeline("kernel_dsv4_hc_expand4");
         if (!g_dsv4_indexer_score_one_direct_pipeline ||
@@ -4180,6 +4201,7 @@ int ds4_gpu_init(void) {
             !g_dsv4_softplus_sqrt_pipeline ||
             !g_dsv4_router_finalize_one_pipeline ||
             !g_dsv4_router_weights_one_pipeline ||
+            !g_dsv4_route_translate_pipeline ||
             !g_dsv4_hc_expand4_pipeline) {
             g_queue = nil;
             g_device = nil;
@@ -4416,6 +4438,40 @@ int ds4_gpu_end_commands(void) {
     return ds4_gpu_finish_command_buffer(cb, 1, "command batch");
 }
 
+/* Tensor-parallel host/GPU rendezvous. Instead of draining the whole pipeline
+ * with waitUntilCompleted (slow per-CB scheduling path), we signal a
+ * MTLSharedEvent at the end of the current batch and let the host wait on that
+ * specific value — the MTLSharedEvent.waitUntilSignaledValue fast path
+ * (Anukari/Apple precedent: ~150ms -> <50us per sync). The caller flushes the
+ * batch (commit, no wait) right after signalling so the GPU runs and fires the
+ * event while the host proceeds. */
+static id<MTLSharedEvent> g_tp_event;
+static uint64_t g_tp_event_value;
+
+uint64_t ds4_gpu_tp_signal_after_batch(void) {
+    if (!g_batch_cb) return 0;
+    ds4_gpu_close_batch_encoder();
+    if (!g_tp_event) {
+        g_tp_event = [g_device newSharedEvent];
+        if (!g_tp_event) return 0;
+    }
+    uint64_t value = ++g_tp_event_value; /* values are reserved nonzero (0 == error) */
+    [g_batch_cb encodeSignalEvent:g_tp_event value:value];
+    return value;
+}
+
+int ds4_gpu_tp_host_wait(uint64_t value) {
+    if (!g_tp_event || value == 0) return 0;
+    uint64_t timeout_ms = 60000;
+    const char *env = getenv("DS4_TP_EVENT_TIMEOUT_MS");
+    if (env && env[0]) {
+        char *end = NULL;
+        unsigned long v = strtoul(env, &end, 10);
+        if (end != env && *end == '\0' && v > 0) timeout_ms = (uint64_t)v;
+    }
+    return [g_tp_event waitUntilSignaledValue:value timeoutMS:timeout_ms] ? 1 : 0;
+}
+
 static int ds4_gpu_flash_attn_stage_profile_boundary(
         id<MTLCommandBuffer> __strong *cbp,
         const char           *mode,
@@ -4486,6 +4542,8 @@ void ds4_gpu_cleanup(void) {
         }
         (void)ds4_gpu_wait_pending_command_buffers("cleanup");
         [g_transient_buffers removeAllObjects];
+        g_tp_event = nil;
+        g_tp_event_value = 0;
         g_set_rows_f32_i32_pipeline = nil;
         g_get_rows_f32_pipeline = nil;
         g_get_rows_f16_pipeline = nil;
@@ -4548,6 +4606,7 @@ void ds4_gpu_cleanup(void) {
         g_dsv4_softplus_sqrt_pipeline = nil;
         g_dsv4_router_finalize_one_pipeline = nil;
         g_dsv4_router_weights_one_pipeline = nil;
+        g_dsv4_route_translate_pipeline = nil;
         g_dsv4_hc_expand4_pipeline = nil;
         g_flash_attn_mask_buffer = nil;
         g_flash_attn_pad_buffer = nil;
@@ -4565,6 +4624,8 @@ void ds4_gpu_cleanup(void) {
         g_embed_rows_buffer = nil;
         g_router_selection_buffer = nil;
         g_router_weight_sum_buffer = nil;
+        g_expert_keep_lut_buffer = nil;
+        g_expert_keep_lut_layers = 0;
         g_indexer_head_scores_buffer = nil;
         g_indexer_topk_buffer = nil;
         g_indexed_topk_buffer = nil;
@@ -4932,16 +4993,25 @@ int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint
     }
 }
 
-int ds4_gpu_set_model_map_spans(
+/* Shared implementation for the plain and split span loaders. resident_flags is
+ * an optional per-span bool array: when NULL every span is resident (legacy
+ * behaviour); otherwise a false entry wraps that span's views without adding them
+ * to the model residency set, so their clean file-backed pages stay reclaimable
+ * (routed-expert offload under DS4_METAL_EXPERT_OFFLOAD). */
+static int ds4_gpu_set_model_map_spans_impl(
         const void *model_map,
         uint64_t model_size,
         const uint64_t *offsets,
         const uint64_t *sizes,
+        const bool *resident_flags,
         uint32_t count,
         uint64_t max_tensor_bytes) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!model_map || model_size == 0 || !offsets || !sizes || count == 0) return 0;
-    if (count == 1) {
+    /* A single all-resident span is exactly the contiguous range loader; skip the
+     * disjoint-buffer bookkeeping. A non-resident single span still needs the
+     * per-view resident_hint, so fall through to the general path for it. */
+    if (count == 1 && (!resident_flags || resident_flags[0])) {
         return ds4_gpu_set_model_map_range(model_map,
                                            model_size,
                                            offsets[0],
@@ -4968,11 +5038,13 @@ int ds4_gpu_set_model_map_spans(
             if (offsets[i] < first_offset) first_offset = offsets[i];
             uint64_t effective_max = max_tensor_bytes;
             if (effective_max > sizes[i]) effective_max = sizes[i];
+            const bool span_resident = resident_flags ? resident_flags[i] : true;
             if (!ds4_gpu_add_model_view_range(model_map,
                                               model_size,
                                               offsets[i],
                                               sizes[i],
                                               effective_max,
+                                              span_resident,
                                               &mapped_total)) {
                 ds4_gpu_model_residency_clear();
                 ds4_gpu_model_views_clear();
@@ -4995,6 +5067,35 @@ int ds4_gpu_set_model_map_spans(
                 count);
         return 1;
     }
+}
+
+int ds4_gpu_set_model_map_spans(
+        const void *model_map,
+        uint64_t model_size,
+        const uint64_t *offsets,
+        const uint64_t *sizes,
+        uint32_t count,
+        uint64_t max_tensor_bytes) {
+    return ds4_gpu_set_model_map_spans_impl(model_map, model_size, offsets, sizes,
+                                            NULL, count, max_tensor_bytes);
+}
+
+/* Reduced-memory loader: resident spans (backbone) are wrapped and added to the
+ * residency set; non-resident spans (routed experts) are wrapped so the hot path
+ * still resolves a buffer, but are kept out of the residency set so their clean
+ * file-backed pages stay reclaimable. Concatenate the two span lists, mark the
+ * resident ones true and the rest false, and pass one array. */
+int ds4_gpu_set_model_map_spans_split(
+        const void *model_map,
+        uint64_t model_size,
+        const uint64_t *offsets,
+        const uint64_t *sizes,
+        const bool *resident_flags,
+        uint32_t count,
+        uint64_t max_tensor_bytes) {
+    if (!resident_flags) return 0;   /* split loader requires explicit flags */
+    return ds4_gpu_set_model_map_spans_impl(model_map, model_size, offsets, sizes,
+                                            resident_flags, count, max_tensor_bytes);
 }
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
@@ -5036,6 +5137,19 @@ static id<MTLBuffer> ds4_gpu_wrap_model_range(
             "ds4: Metal model range %.2f..%.2f GiB is not covered by mapped model views\n",
             ds4_gpu_gib(offset),
             ds4_gpu_gib(end));
+    if (getenv("DS4_METAL_EXPERT_OFFLOAD_DEBUG") != NULL) {
+        fprintf(stderr, "ds4:   wanted exact bytes [%llu, %llu) over %u views:\n",
+                (unsigned long long)offset, (unsigned long long)end, g_model_view_count);
+        for (uint32_t i = 0; i < g_model_view_count; i++) {
+            const uint64_t vs = g_model_views[i].model_offset;
+            const uint64_t ve = vs + g_model_views[i].bytes;
+            if (offset < ve + (64ull << 20) && end + (64ull << 20) > vs) {
+                fprintf(stderr, "ds4:     view[%u] bytes [%llu, %llu) resident=%d\n",
+                        i, (unsigned long long)vs, (unsigned long long)ve,
+                        g_model_views[i].resident_hint);
+            }
+        }
+    }
     return nil;
 }
 
@@ -13792,6 +13906,91 @@ static int ds4_gpu_encode_router_select(
          threadsPerThreadgroup:MTLSizeMake(ds4_gpu_bin_threads(n_expert_used, g_bin_mul_scalar_pipeline), 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
 
+    return 1;
+}
+
+/* Upload the reduced-expert original-id -> compact-slot LUT into a small resident
+ * GPU buffer. n_layer * 256 int16 (~21 KiB for 43 layers). Called once at load
+ * for a shrunken model; a full model never calls this so the translation kernel
+ * stays a no-op. Replaces any previous LUT. */
+int ds4_gpu_set_expert_keep_lut(const int16_t *lut, uint32_t n_layer) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!lut || n_layer == 0) return 0;
+    @autoreleasepool {
+        const NSUInteger bytes = (NSUInteger)n_layer * 256u * sizeof(int16_t);
+        id<MTLBuffer> buf = [g_device newBufferWithBytes:lut
+                                                  length:bytes
+                                                 options:MTLResourceStorageModeShared];
+        if (!buf) {
+            fprintf(stderr, "ds4: failed to allocate Metal expert keep-map LUT (%llu bytes)\n",
+                    (unsigned long long)bytes);
+            return 0;
+        }
+        buf.label = @"ds4_expert_keep_lut";
+        g_expert_keep_lut_buffer = buf;
+        g_expert_keep_lut_layers = n_layer;
+    }
+    return 1;
+}
+
+/* Rewrite a routed-expert selection tensor from original ids (0..255) to the
+ * compact slots of a shrunken model's expert tensors, in place. Runs between
+ * router selection and the routed-MoE matvec. No-op (returns 1) when no keep-map
+ * LUT has been set, so a full model is unaffected. The kernel maps both top-k and
+ * first-3-layer hash selections (both live in the same `selected` tensor) and
+ * clamps dropped/out-of-range experts to slot 0 so the matvec never indexes out
+ * of bounds. */
+int ds4_gpu_translate_expert_ids(
+        ds4_gpu_tensor       *selected,
+        uint32_t                layer,
+        uint32_t                n_expert_used,
+        uint32_t                n_tokens,
+        uint32_t                n_total_expert) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!g_expert_keep_lut_buffer) return 1;   /* full model: nothing to translate */
+    if (!selected || n_expert_used == 0 || n_tokens == 0 || n_total_expert == 0) return 0;
+    if (layer >= g_expert_keep_lut_layers) {
+        fprintf(stderr, "ds4: expert id translation layer %u out of LUT range %u\n",
+                layer, g_expert_keep_lut_layers);
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> selbuf = ds4_gpu_tensor_buffer(selected);
+        const uint64_t need = (uint64_t)n_tokens * n_expert_used * sizeof(int32_t);
+        if (!selbuf || ds4_gpu_tensor_bytes(selected) < need) {
+            fprintf(stderr, "ds4: Metal expert id translation received an undersized selection buffer\n");
+            return 0;
+        }
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_hot_pipeline(g_dsv4_route_translate_pipeline,
+                                    "kernel_dsv4_route_translate");
+        if (!pipeline) return 0;
+
+        struct {
+            uint32_t layer;
+            uint32_t n_expert_used;
+            uint32_t n_tokens;
+            uint32_t n_total_expert;
+        } args = { layer, n_expert_used, n_tokens, n_total_expert };
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:g_expert_keep_lut_buffer offset:0 atIndex:1];
+        [enc setBuffer:selbuf offset:ds4_gpu_tensor_offset(selected) atIndex:2];
+        const NSUInteger total = (NSUInteger)n_tokens * n_expert_used;
+        NSUInteger tg = pipeline.maxTotalThreadsPerThreadgroup;
+        if (tg > total) tg = total;
+        if (tg == 0) tg = 1;
+        [enc dispatchThreads:MTLSizeMake(total, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "expert id translation")) return 0;
+    }
     return 1;
 }
 

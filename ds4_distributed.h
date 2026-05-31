@@ -15,6 +15,18 @@
 typedef ds4_distributed_options ds4_dist_options;
 typedef struct ds4_dist_session ds4_dist_session;
 
+/* Tensor-parallel all-reduce transport (Stage 2 skeleton). A single persistent
+ * socket between the two TP peers; ds4_dist_tp_allreduce_f32 sums each peer's
+ * partial [count] float vector so both end with the full result. The listener
+ * side calls ds4_dist_tp_listen, the connector ds4_dist_tp_connect. */
+typedef struct ds4_dist_tp ds4_dist_tp;
+ds4_dist_tp *ds4_dist_tp_listen(const char *host, int port, char *err, size_t errlen);
+ds4_dist_tp *ds4_dist_tp_connect(const char *host, int port, char *err, size_t errlen);
+int ds4_dist_tp_allreduce_f32(ds4_dist_tp *tp, float *buf, uint32_t count);
+void ds4_dist_tp_free(ds4_dist_tp *tp);
+ds4_dist_tp *ds4_engine_tp(ds4_engine *e); /* implemented in ds4.c */
+int ds4_dist_tp_selftest(void); /* in-process loopback correctness check */
+
 /* Options used by standalone `./ds4 --role coordinator -p ...` generation.
  * Interactive tools and the server go through the normal ds4_session API.
  */

@@ -34,7 +34,7 @@ CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression
+.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression e0
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -200,4 +200,10 @@ test: ds4_test ds4-eval
 	./ds4_test
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test e0-pingpong *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+
+# Task 04 / E0: standalone thunderbolt ping-pong latency gate (no core deps, no
+# model). Defined after the default targets so it never becomes the default goal.
+e0: e0-pingpong
+e0-pingpong: tools/e0_pingpong.c
+	$(CC) $(CFLAGS) -o $@ tools/e0_pingpong.c -lm

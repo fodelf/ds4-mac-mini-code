@@ -1599,6 +1599,12 @@ static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
 
+/* TP Stage 2: in-process loopback check of the all-reduce transport (frame
+ * format + sum correctness + no deadlock). No model, no network. */
+static void test_tp_allreduce(void) {
+    TEST_ASSERT(ds4_dist_tp_selftest() == 0);
+}
+
 typedef void (*test_fn)(void);
 
 typedef struct {
@@ -1619,6 +1625,7 @@ static const ds4_test_entry test_entries[] = {
     {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
+    {"--tp-allreduce", "tp-allreduce", "tensor-parallel all-reduce transport loopback", test_tp_allreduce},
 };
 
 static void test_print_help(const char *prog) {

@@ -1715,7 +1715,7 @@ int main(int argc, char **argv) {
         free(cfg.prompt_owned);
         return 1;
     }
-    if (cfg.dist && cfg.dist->role == DS4_DISTRIBUTED_WORKER) {
+    if (cfg.dist && (cfg.dist->role == DS4_DISTRIBUTED_WORKER || cfg.dist->tp_enabled)) {
         ds4_dist_generation_options dist_gen = {
             .prompt = cfg.gen.prompt,
             .system = cfg.gen.system,

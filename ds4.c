@@ -721,6 +721,186 @@ static double now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
 }
 
+/* ---- Stage 0: phys_footprint watchdog + DS4_PROFILE timing (see task/02) ----
+ * Watchdog samples the Mach phys_footprint every 200ms (NOT ps/rss, which is
+ * blind to Metal no-copy mmap residency: 9.3GiB resident reads as ~38MiB),
+ * tracks the peak, and _exit()s before crossing 90% of DS4_MEM_BUDGET_MB so the
+ * machine never page-thrashes. A constructor self-starts it so the whole
+ * process -- including the big model mmap + residency wiring during load -- is
+ * covered, without touching any hot path. With neither DS4_MEM_BUDGET_MB nor
+ * DS4_PROFILE set it returns after one getenv (no thread) = zero overhead.
+ * DS4_PROFILE accumulates load/prefill/decode wall time and, at exit, writes one
+ * CSV-ish line to DS4_PROFILE_FILE (or stderr). */
+#if defined(__APPLE__)
+#include <mach/mach.h>
+static uint64_t ds4_phys_footprint_bytes(void) {
+    task_vm_info_data_t info;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &count) != KERN_SUCCESS) return 0;
+    return (uint64_t)info.phys_footprint;
+}
+#else
+static uint64_t ds4_phys_footprint_bytes(void) { return 0; }
+#endif
+
+#define DS4_GIB (1024.0 * 1024.0 * 1024.0)
+
+static pthread_t         g_mem_watch_thread;
+static volatile int      g_mem_watch_run = 0;
+static int               g_mem_watch_started = 0;
+static uint64_t          g_mem_budget_bytes = 0;
+static volatile uint64_t g_mem_peak_footprint = 0;
+
+typedef struct {
+    int      inited;
+    int      enabled;
+    const char *csv_path;
+    double   load_sec;
+    uint64_t load_footprint_delta;
+    uint64_t prefill_tokens;
+    uint32_t prefill_chunks;
+    double   prefill_sec;
+    uint64_t decode_tokens;
+    double   decode_sec;
+} ds4_profile_state;
+static ds4_profile_state g_prof;
+static DS4_MAYBE_UNUSED double   g_prof_load_begin_sec;
+static DS4_MAYBE_UNUSED uint64_t g_prof_load_footprint_begin;
+
+static void ds4_profile_init(void) {
+    if (g_prof.inited) return;
+    g_prof.inited = 1;
+    g_prof.enabled = getenv("DS4_PROFILE") != NULL;
+    g_prof.csv_path = getenv("DS4_PROFILE_FILE");
+}
+
+static void ds4_profile_flush(void) {
+    if (!g_prof.enabled && !g_mem_watch_started) return;
+    uint64_t peak = g_mem_peak_footprint;
+    uint64_t now = ds4_phys_footprint_bytes();
+    if (now > peak) peak = now;
+    double ptps = g_prof.prefill_sec > 0.0 ? (double)g_prof.prefill_tokens / g_prof.prefill_sec : 0.0;
+    double dtps = g_prof.decode_sec  > 0.0 ? (double)g_prof.decode_tokens  / g_prof.decode_sec  : 0.0;
+    FILE *f = stderr;
+    int close_f = 0;
+    if (g_prof.csv_path && g_prof.csv_path[0]) {
+        FILE *cf = fopen(g_prof.csv_path, "a");
+        if (cf) { f = cf; close_f = 1; }
+    }
+    fprintf(f,
+            "ds4_profile load_sec=%.3f load_footprint_gib=%.3f "
+            "prefill_tokens=%" PRIu64 " prefill_chunks=%u prefill_sec=%.3f prefill_tps=%.2f "
+            "decode_tokens=%" PRIu64 " decode_sec=%.3f decode_tps=%.2f "
+            "peak_footprint_gib=%.3f budget_gib=%.3f\n",
+            g_prof.load_sec, (double)g_prof.load_footprint_delta / DS4_GIB,
+            g_prof.prefill_tokens, g_prof.prefill_chunks, g_prof.prefill_sec, ptps,
+            g_prof.decode_tokens, g_prof.decode_sec, dtps,
+            (double)peak / DS4_GIB, (double)g_mem_budget_bytes / DS4_GIB);
+    if (close_f) fclose(f);
+}
+
+static DS4_MAYBE_UNUSED void ds4_profile_load_begin(void) {
+    ds4_profile_init();
+    if (!g_prof.enabled) return;
+    g_prof_load_begin_sec = now_sec();
+    g_prof_load_footprint_begin = ds4_phys_footprint_bytes();
+}
+
+static DS4_MAYBE_UNUSED void ds4_profile_load_end(void) {
+    if (!g_prof.enabled) return;
+    g_prof.load_sec += now_sec() - g_prof_load_begin_sec;
+    uint64_t fp = ds4_phys_footprint_bytes();
+    if (fp > g_prof_load_footprint_begin) g_prof.load_footprint_delta += fp - g_prof_load_footprint_begin;
+}
+
+static DS4_MAYBE_UNUSED void ds4_profile_add_prefill(uint64_t tokens, double sec) {
+    if (!g_prof.enabled) return;
+    g_prof.prefill_tokens += tokens;
+    g_prof.prefill_sec += sec;
+    g_prof.prefill_chunks++;
+}
+
+static DS4_MAYBE_UNUSED void ds4_profile_add_decode(uint64_t tokens, double sec) {
+    if (!g_prof.enabled) return;
+    g_prof.decode_tokens += tokens;
+    g_prof.decode_sec += sec;
+}
+
+static void *ds4_mem_watchdog_main(void *arg) {
+    (void)arg;
+    while (g_mem_watch_run) {
+        uint64_t fp = ds4_phys_footprint_bytes();
+        if (fp > g_mem_peak_footprint) g_mem_peak_footprint = fp;
+        if (g_mem_budget_bytes != 0 && fp > (uint64_t)((double)g_mem_budget_bytes * 0.9)) {
+            fprintf(stderr,
+                    "\n[ds4-watchdog] phys_footprint %.2f GiB crossed 90%% of the "
+                    "%.2f GiB budget -- aborting before page thrash.\n",
+                    (double)fp / DS4_GIB, (double)g_mem_budget_bytes / DS4_GIB);
+            fflush(stderr);
+            _exit(137);
+        }
+        usleep(200000);
+    }
+    return NULL;
+}
+
+static void ds4_mem_watchdog_start(void) {
+    if (g_mem_watch_started) return;
+    ds4_profile_init();
+    const char *bud = getenv("DS4_MEM_BUDGET_MB");
+    if (bud && bud[0]) {
+        long mb = strtol(bud, NULL, 10);
+        if (mb > 0) g_mem_budget_bytes = (uint64_t)mb * 1024ull * 1024ull;
+    }
+    if (!g_prof.enabled && g_mem_budget_bytes == 0) return;
+    g_mem_watch_run = 1;
+    if (pthread_create(&g_mem_watch_thread, NULL, ds4_mem_watchdog_main, NULL) != 0) {
+        g_mem_watch_run = 0;
+        return;
+    }
+    g_mem_watch_started = 1;
+    atexit(ds4_profile_flush);
+}
+
+__attribute__((constructor)) static void ds4_stage0_autostart(void) {
+    ds4_mem_watchdog_start();
+}
+
+/* L1 pre-flight static budget gate. Called once the resident model byte total is
+ * known (model map span sums), before any GPU buffer is bound. Aborts a planned
+ * OOM at load time -- well ahead of the runtime watchdog -- when the closed-form
+ * resident estimate crosses 85% of DS4_MEM_BUDGET_MB. kv_and_scratch_bytes is the
+ * caller's estimate of KV + prefill scratch + fixed overhead (0 if unknown; the
+ * runtime watchdog still backstops). No budget set => no-op (zero behavior change). */
+static DS4_MAYBE_UNUSED void ds4_l1_budget_gate(uint64_t resident_model_bytes,
+                                                uint64_t kv_and_scratch_bytes) {
+    ds4_profile_init();
+    if (g_mem_budget_bytes == 0) {
+        const char *bud = getenv("DS4_MEM_BUDGET_MB");
+        if (bud && bud[0]) {
+            long mb = strtol(bud, NULL, 10);
+            if (mb > 0) g_mem_budget_bytes = (uint64_t)mb * 1024ull * 1024ull;
+        }
+    }
+    if (g_mem_budget_bytes == 0) return;
+    const uint64_t planned = resident_model_bytes + kv_and_scratch_bytes;
+    const uint64_t limit = (uint64_t)((double)g_mem_budget_bytes * 0.85);
+    if (planned > limit) {
+        fprintf(stderr,
+                "\n[ds4-l1-gate] planned resident %.2f GiB (model %.2f + kv/scratch %.2f) "
+                "exceeds 85%% of the %.2f GiB budget -- refusing to load.\n",
+                (double)planned / DS4_GIB,
+                (double)resident_model_bytes / DS4_GIB,
+                (double)kv_and_scratch_bytes / DS4_GIB,
+                (double)g_mem_budget_bytes / DS4_GIB);
+        fflush(stderr);
+        _exit(137);
+    }
+    fprintf(stderr,
+            "ds4: L1 budget gate: planned resident %.2f GiB within %.2f GiB budget\n",
+            (double)planned / DS4_GIB, (double)g_mem_budget_bytes / DS4_GIB);
+}
+
 static void sleep_sec(double sec) {
     if (sec <= 0.0 || !isfinite(sec)) return;
     struct timespec req;
@@ -1147,6 +1327,16 @@ typedef struct {
 
     ds4_kv *kv;
     ds4_tensor *tensors;
+
+    /* Reduced-expert ("keep-map") models: a shrunken GGUF stores only the kept
+     * routed experts per layer (ffn_*_exps dim[2] = kept count, not DS4_N_EXPERT),
+     * while the router still emits 256-wide logits. These map original expert id
+     * -> compact slot in the shrunken tensor; -1 means the expert was dropped.
+     * Populated by load_expert_keep_map(); empty/NULL for a full model. */
+    bool      expert_shrunken;
+    uint32_t  expert_layer_count;          /* layers covered by the keep-map */
+    uint16_t *expert_kept_count;           /* [expert_layer_count]: kept experts per layer */
+    int16_t  *expert_orig_to_compact;      /* [expert_layer_count * DS4_N_EXPERT]: orig id -> slot, or -1 */
 } ds4_model;
 
 static uint64_t scalar_value_size(uint32_t type) {
@@ -1340,10 +1530,96 @@ static bool model_get_array(const ds4_model *m, const char *key, ds4_array_ref *
     return true;
 }
 
+/* Kept routed-expert count for layer il. DS4_N_EXPERT for a full model, or the
+ * shrunken count when a keep-map is present. Safe for il past the keep-map. */
+static uint32_t model_expert_kept_count(const ds4_model *m, uint32_t il) {
+    if (!m || !m->expert_kept_count || il >= m->expert_layer_count) {
+        return DS4_N_EXPERT;
+    }
+    return m->expert_kept_count[il];
+}
+
+/* Parse the optional ds4.expert_keep_map.* metadata written by gguf-tools/
+ * shrink_gguf.py. When present, the routed-expert tensors only carry the kept
+ * rows; this builds the original-id -> compact-slot table so routing still works
+ * with the full 256-wide router logits. No-op for a full model. */
+static void load_expert_keep_map(ds4_model *m) {
+    ds4_array_ref counts_arr;
+    ds4_array_ref ids_arr;
+    const bool has_counts = model_get_array(m, "ds4.expert_keep_map.kept_counts", &counts_arr);
+    const bool has_ids    = model_get_array(m, "ds4.expert_keep_map.original_ids", &ids_arr);
+    if (!has_counts && !has_ids) return;
+    if (has_counts != has_ids) {
+        ds4_die("ds4.expert_keep_map: kept_counts and original_ids must appear together");
+    }
+    if (counts_arr.type != GGUF_VALUE_INT32 && counts_arr.type != GGUF_VALUE_UINT32) {
+        ds4_die("ds4.expert_keep_map.kept_counts must be an int32 array");
+    }
+    if (ids_arr.type != GGUF_VALUE_INT32 && ids_arr.type != GGUF_VALUE_UINT32) {
+        ds4_die("ds4.expert_keep_map.original_ids must be an int32 array");
+    }
+    if (counts_arr.len == 0 || counts_arr.len > 1024) {
+        ds4_die("ds4.expert_keep_map.kept_counts has an unreasonable length");
+    }
+
+    m->expert_layer_count = (uint32_t)counts_arr.len;
+    m->expert_kept_count = calloc(m->expert_layer_count, sizeof(m->expert_kept_count[0]));
+    m->expert_orig_to_compact = calloc((size_t)m->expert_layer_count * DS4_N_EXPERT,
+                                       sizeof(m->expert_orig_to_compact[0]));
+    if (!m->expert_kept_count || !m->expert_orig_to_compact) {
+        ds4_die("out of memory while allocating expert keep-map");
+    }
+    for (size_t i = 0; i < (size_t)m->expert_layer_count * DS4_N_EXPERT; i++) {
+        m->expert_orig_to_compact[i] = -1;          /* -1 == dropped */
+    }
+
+    uint64_t expected_ids_len = 0;
+    ds4_cursor cc = cursor_at(m, counts_arr.data_pos);
+    for (uint32_t il = 0; il < m->expert_layer_count; il++) {
+        int32_t v = 0;
+        if (!cursor_read(&cc, &v, sizeof(v))) ds4_die(cc.error);
+        if (v < 1 || v > (int32_t)DS4_N_EXPERT) {
+            ds4_die("ds4.expert_keep_map.kept_counts has an out-of-range value");
+        }
+        m->expert_kept_count[il] = (uint16_t)v;
+        expected_ids_len += (uint64_t)v;
+    }
+    if (ids_arr.len != expected_ids_len) {
+        ds4_die("ds4.expert_keep_map.original_ids length does not match sum(kept_counts)");
+    }
+
+    ds4_cursor ic = cursor_at(m, ids_arr.data_pos);
+    for (uint32_t il = 0; il < m->expert_layer_count; il++) {
+        const uint16_t k = m->expert_kept_count[il];
+        int16_t *row = m->expert_orig_to_compact + (size_t)il * DS4_N_EXPERT;
+        for (uint16_t slot = 0; slot < k; slot++) {
+            int32_t orig = 0;
+            if (!cursor_read(&ic, &orig, sizeof(orig))) ds4_die(ic.error);
+            if (orig < 0 || orig >= (int32_t)DS4_N_EXPERT) {
+                ds4_die("ds4.expert_keep_map.original_ids contains an out-of-range expert id");
+            }
+            if (row[orig] != -1) {
+                ds4_die("ds4.expert_keep_map.original_ids has a duplicate expert id in one layer");
+            }
+            row[orig] = (int16_t)slot;
+        }
+    }
+    m->expert_shrunken = true;
+    uint32_t min_kept = DS4_N_EXPERT;
+    for (uint32_t il = 0; il < m->expert_layer_count; il++) {
+        if (m->expert_kept_count[il] < min_kept) min_kept = m->expert_kept_count[il];
+    }
+    fprintf(stderr,
+            "ds4: reduced-expert model: keep-map over %u layers (min kept %u of %u)\n",
+            m->expert_layer_count, min_kept, (uint32_t)DS4_N_EXPERT);
+}
+
 static void model_close(ds4_model *m) {
     if (!m) return;
     free(m->kv);
     free(m->tensors);
+    free(m->expert_kept_count);
+    free(m->expert_orig_to_compact);
     if (m->map) munmap((void *)m->map, (size_t)m->size);
     if (m->fd >= 0) close(m->fd);
     memset(m, 0, sizeof(*m));
@@ -1506,6 +1782,19 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
 
     parse_metadata(m, &c);
     parse_tensors(m, &c);
+    load_expert_keep_map(m);
+#ifndef DS4_NO_GPU
+    /* Upload the reduced-expert routing LUT to the GPU so routed-MoE matvecs can
+     * translate full-256 router ids to compact expert-tensor slots. No-op for a
+     * full model (keep-map absent). GPU-only: the keep-map table itself
+     * (expert_orig_to_compact, built in load_expert_keep_map) is the source of
+     * truth; the CPU reference path is not wired for shrunken models. */
+    if (m->expert_shrunken && m->expert_orig_to_compact) {
+        if (!ds4_gpu_set_expert_keep_lut(m->expert_orig_to_compact, m->expert_layer_count)) {
+            ds4_die("failed to upload reduced-expert routing LUT to the GPU");
+        }
+    }
+#endif
 
     if (!metal_mapping && prefetch_cpu) model_prefetch_cpu_mapping(m);
 }
@@ -2599,7 +2888,7 @@ static void tensor_expect_routed_expert(
 
 /* Verify every tensor type and dimension used by the specialized pipeline.
  * After this succeeds, inference code can rely on fixed DS4 constants. */
-static void weights_validate_layout(const ds4_weights *w) {
+static void weights_validate_layout(const ds4_model *m, const ds4_weights *w) {
     const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
     const uint64_t hc_mix_dim = 2u * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
@@ -2654,9 +2943,12 @@ static void weights_validate_layout(const ds4_weights *w) {
         tensor_expect_layout(l->ffn_norm,       DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
         tensor_expect_layout(l->ffn_gate_inp,   DS4_TENSOR_F16,  2, DS4_N_EMBD, DS4_N_EXPERT, 0);
         tensor_expect_optional(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, DS4_N_EXPERT, 0, 0);
-        tensor_expect_routed_expert(l->ffn_gate_exps, 3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
-        tensor_expect_routed_expert(l->ffn_up_exps,   3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
-        tensor_expect_routed_expert(l->ffn_down_exps, 3, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
+        /* A shrunken (keep-map) model carries only the kept routed experts; the
+         * router + ffn_gate_inp + ffn_exp_probs_b stay 256-wide above. */
+        const uint64_t exp_dim = model_expert_kept_count(m, il);
+        tensor_expect_routed_expert(l->ffn_gate_exps, 3, DS4_N_EMBD, DS4_N_FF_EXP, exp_dim);
+        tensor_expect_routed_expert(l->ffn_up_exps,   3, DS4_N_EMBD, DS4_N_FF_EXP, exp_dim);
+        tensor_expect_routed_expert(l->ffn_down_exps, 3, DS4_N_FF_EXP, DS4_N_EMBD, exp_dim);
         if (l->ffn_gate_exps->type != l->ffn_up_exps->type) {
             fprintf(stderr, "ds4: routed gate/up experts use different quant types in layer %u\n", il);
             exit(1);
@@ -3087,7 +3379,7 @@ static void weights_bind(ds4_weights *w, const ds4_model *m) {
         }
     }
 
-    weights_validate_layout(w);
+    weights_validate_layout(m, w);
 }
 
 typedef struct {
@@ -3218,6 +3510,96 @@ static DS4_MAYBE_UNUSED bool weights_model_map_spans(
     }
     spans->len = out;
     return spans->len != 0;
+}
+
+/* Collect this layer's routed-expert weight tensors (ffn_gate/up/down_exps) into
+ * `experts` and every other layer tensor into `backbone`. Mirrors
+ * model_map_span_vec_include_layer but splits by tensor role so a reduced-memory
+ * loader can keep the backbone resident and let cold experts stay reclaimable. */
+static void model_map_span_vec_split_layer(
+        ds4_model_map_span_vec *backbone,
+        ds4_model_map_span_vec *experts,
+        const ds4_layer_weights *l) {
+#define DS4_BACKBONE(t_) model_map_span_vec_include_one(backbone, (t_))
+#define DS4_EXPERT(t_)   model_map_span_vec_include_one(experts, (t_))
+    DS4_BACKBONE(l->hc_attn_fn);
+    DS4_BACKBONE(l->hc_attn_scale);
+    DS4_BACKBONE(l->hc_attn_base);
+    DS4_BACKBONE(l->attn_norm);
+    DS4_BACKBONE(l->attn_q_a);
+    DS4_BACKBONE(l->attn_q_a_norm);
+    DS4_BACKBONE(l->attn_q_b);
+    DS4_BACKBONE(l->attn_kv);
+    DS4_BACKBONE(l->attn_kv_a_norm);
+    DS4_BACKBONE(l->attn_sinks);
+    DS4_BACKBONE(l->attn_output_a);
+    DS4_BACKBONE(l->attn_output_b);
+    DS4_BACKBONE(l->attn_compressor_ape);
+    DS4_BACKBONE(l->attn_compressor_kv);
+    DS4_BACKBONE(l->attn_compressor_gate);
+    DS4_BACKBONE(l->attn_compressor_norm);
+    DS4_BACKBONE(l->indexer_attn_q_b);
+    DS4_BACKBONE(l->indexer_proj);
+    DS4_BACKBONE(l->indexer_compressor_ape);
+    DS4_BACKBONE(l->indexer_compressor_kv);
+    DS4_BACKBONE(l->indexer_compressor_gate);
+    DS4_BACKBONE(l->indexer_compressor_norm);
+    DS4_BACKBONE(l->hc_ffn_fn);
+    DS4_BACKBONE(l->hc_ffn_scale);
+    DS4_BACKBONE(l->hc_ffn_base);
+    DS4_BACKBONE(l->ffn_norm);
+    DS4_BACKBONE(l->ffn_gate_tid2eid);
+    DS4_BACKBONE(l->ffn_gate_inp);
+    DS4_BACKBONE(l->ffn_exp_probs_b);
+    /* Routed experts: the bulk of the model, only top-K fire per token. */
+    DS4_EXPERT(l->ffn_gate_exps);
+    DS4_EXPERT(l->ffn_up_exps);
+    DS4_EXPERT(l->ffn_down_exps);
+    /* Shared expert fires every token: it is backbone, not routed. */
+    DS4_BACKBONE(l->ffn_gate_shexp);
+    DS4_BACKBONE(l->ffn_up_shexp);
+    DS4_BACKBONE(l->ffn_down_shexp);
+#undef DS4_BACKBONE
+#undef DS4_EXPERT
+}
+
+static void model_map_span_vec_finalize(ds4_model_map_span_vec *spans) {
+    if (spans->len == 0) return;
+    qsort(spans->v, spans->len, sizeof(spans->v[0]), model_map_span_cmp);
+    uint32_t out = 0;
+    for (uint32_t i = 0; i < spans->len; i++) {
+        if (out == 0 || spans->v[i].off > spans->v[out - 1u].end) {
+            spans->v[out++] = spans->v[i];
+        } else if (spans->v[i].end > spans->v[out - 1u].end) {
+            spans->v[out - 1u].end = spans->v[i].end;
+        }
+    }
+    spans->len = out;
+}
+
+/* Build the backbone (resident) and routed-expert (reclaimable) span lists for a
+ * reduced-memory Metal load. Returns false if either list is empty or sizes look
+ * wrong; the caller then falls back to the whole-tensor-data range loader. */
+static bool weights_model_map_spans_split(
+        const ds4_weights *w,
+        ds4_model_map_span_vec *backbone,
+        ds4_model_map_span_vec *experts) {
+    if (!w || !backbone || !experts) return false;
+    memset(backbone, 0, sizeof(*backbone));
+    memset(experts, 0, sizeof(*experts));
+
+    model_map_span_vec_include_one(backbone, w->token_embd);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        model_map_span_vec_split_layer(backbone, experts, &w->layer[il]);
+    }
+    model_map_span_vec_include_output(backbone, w);
+
+    model_map_span_vec_finalize(backbone);
+    model_map_span_vec_finalize(experts);
+
+    if (backbone->len == 0 || experts->len == 0) return false;
+    if (backbone->max_tensor_bytes == 0) return false;
+    return true;
 }
 
 static void mtp_weights_bind(ds4_mtp_weights *w, const ds4_model *m) {
@@ -8839,6 +9221,19 @@ typedef struct {
     double decode_token_avg_sec;
     bool quality;
     bool mtp_enabled;
+    /* Tensor parallelism (Stage 2 skeleton). When tp != NULL the routed-MoE
+     * output of decode layers [0, tp_layers) is recombined across two peers via
+     * an all-reduce: after the (replicated) routed_moe each peer zeros the half
+     * of routed_out it does not own and sum-all-reduces, reproducing the
+     * single-machine value bit-for-bit before the residual combine. This minimal
+     * element-range partition proves the split point + all-reduce frame + cross-
+     * machine sync with no Metal kernel change; #06 replaces it with a real
+     * compute split (masked experts / ff-row slice). tp == NULL ⇒ byte-identical
+     * to the non-TP path. tp_vec is the host staging buffer for the exchange. */
+    ds4_dist_tp *tp;
+    uint32_t tp_layers;
+    bool tp_owns_low; /* true ⇒ this peer owns the low half of routed_out */
+    float *tp_vec;    /* host staging buffer [DS4_N_EMBD], allocated when tp set */
 } ds4_gpu_graph;
 
 static bool graph_power_throttle_enabled(const ds4_gpu_graph *g) {
@@ -8880,6 +9275,7 @@ static void graph_power_note_decode_token(ds4_gpu_graph *g, double elapsed_sec) 
 
 /* Release every Metal tensor owned by the whole-model graph runtime. */
 static void metal_graph_free(ds4_gpu_graph *g) {
+    free(g->tp_vec); /* TP host staging buffer (the tp socket is owned by the engine) */
     ds4_gpu_tensor_free(g->directional_steering_dirs);
     ds4_gpu_tensor_free(g->batch_ffn_out);
     ds4_gpu_tensor_free(g->batch_routed_out);
@@ -10626,6 +11022,13 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_i32_tensor("ffn_moe_topk", g->router_selected, DS4_N_EXPERT_USED, il, pos);
         metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->router_weights, DS4_N_EXPERT_USED, il, pos);
     }
+    /* Translate full-256 router ids to compact slots for a shrunken model. No-op
+     * for a full model (no LUT set). Runs after the router (weights were gathered
+     * with original ids) and before the routed matvec indexes the kept tensors. */
+    if (ok && model->expert_shrunken) {
+        ok = ds4_gpu_translate_expert_ids(g->router_selected, il, DS4_N_EXPERT_USED, 1,
+                                          model_expert_kept_count(model, il)) != 0;
+    }
     if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
                                                  g->routed_gate,
                                                  g->routed_up,
@@ -10643,7 +11046,7 @@ static bool metal_graph_encode_decode_layer(
                                                  (uint32_t)down_in_dim,
                                                  (uint32_t)routed_out_dim,
                                                  g->router_selected, g->router_weights,
-                                                 DS4_N_EXPERT,
+                                                 model_expert_kept_count(model, il),
                                                  DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm) != 0;
     DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
     if (ok) {
@@ -10662,6 +11065,33 @@ static bool metal_graph_encode_decode_layer(
     }
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_out", g->routed_out, DS4_N_EMBD, il, pos);
+    }
+    /* TP Stage 2: recombine routed_out across the two peers. Rather than draining
+     * the whole pipeline (waitUntilCompleted), signal a MTLSharedEvent at the end
+     * of the batch, flush (commit without a full wait), and host-wait that value
+     * on the fast event path so routed_out becomes host-visible cheaply. Each peer
+     * then zeros its non-owned half and sum-all-reduces, reproducing the single-
+     * machine routed output bit-for-bit. The host writeback lands in unified
+     * memory before the (now reopened) batch's combine is committed, so no GPU
+     * wait-back is needed. Guarded by g->tp ⇒ non-TP path never touches this. */
+    if (ok && g->tp && il < g->tp_layers) {
+        const uint64_t ev = ds4_gpu_tp_signal_after_batch();
+        ok = ev != 0;
+        if (ok) ok = ds4_gpu_flush_commands() != 0;   /* commit (no full drain), reopen batch */
+        if (ok) ok = ds4_gpu_tp_host_wait(ev) != 0;    /* fast wait until routed_moe done */
+        if (ok) ok = ds4_gpu_tensor_read(g->routed_out, 0, g->tp_vec,
+                                         (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
+        if (ok) {
+            const uint32_t half = DS4_N_EMBD / 2;
+            if (g->tp_owns_low) {
+                for (uint32_t i = half; i < DS4_N_EMBD; i++) g->tp_vec[i] = 0.0f;
+            } else {
+                for (uint32_t i = 0; i < half; i++) g->tp_vec[i] = 0.0f;
+            }
+            ok = ds4_dist_tp_allreduce_f32(g->tp, g->tp_vec, DS4_N_EMBD) == 0;
+        }
+        if (ok) ok = ds4_gpu_tensor_write(g->routed_out, 0, g->tp_vec,
+                                          (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
     }
     const bool fuse_shared_gate_up =
         !g->quality &&
@@ -13472,6 +13902,13 @@ static bool metal_graph_encode_layer_ffn_batch(
     }
     DS4_METAL_PROFILE_FFN_STAGE("router");
 
+    /* Translate full-256 router ids to compact slots for a shrunken model (no-op
+     * for a full model). All n_tokens rows share the same per-layer LUT. */
+    if (ok && model->expert_shrunken) {
+        ok = ds4_gpu_translate_expert_ids(g->batch_router_selected, il, DS4_N_EXPERT_USED,
+                                          n_tokens, model_expert_kept_count(model, il)) != 0;
+    }
+
     if (ok) {
         ok = ds4_gpu_routed_moe_batch_tensor(g->batch_routed_out,
                                                g->batch_routed_gate,
@@ -13494,7 +13931,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                (uint32_t)routed_out_dim,
                                                g->batch_router_selected,
                                                g->batch_router_weights,
-                                               DS4_N_EXPERT,
+                                               model_expert_kept_count(model, il),
                                                DS4_N_EXPERT_USED,
                                                DS4_SWIGLU_CLAMP_EXP,
                                                g->batch_ffn_norm,
@@ -15232,6 +15669,10 @@ struct ds4_engine {
     ds4_distributed_options distributed;
     bool metal_ready;
     bool mtp_ready;
+    /* TP peer connection (Stage 2). Established lazily on first session use when
+     * distributed.tp_enabled, shared read-only by the session graph. */
+    ds4_dist_tp *tp;
+    bool tp_owns_low; /* coordinator owns low expert positions */
 };
 
 static bool cpu_directional_steering_enabled(
@@ -18710,6 +19151,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     }
 
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
+    ds4_profile_load_begin();
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
     if (opt->warm_weights) model_warm_weights(&e->model);
     if (!opt->inspect_only) vocab_load(&e->vocab, &e->model);
@@ -18802,6 +19244,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                     load_end,
                     spans.len,
                     (double)span_bytes / 1073741824.0);
+            ds4_l1_budget_gate(span_bytes, 0);
             model_map_ok = ds4_gpu_set_model_map_spans(e->model.map,
                                                         e->model.size,
                                                         offsets,
@@ -18811,7 +19254,75 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             free(offsets);
             free(sizes);
             free(spans.v);
+        } else if (getenv("DS4_METAL_EXPERT_OFFLOAD") != NULL) {
+            /* Reduced-memory load: wire only the backbone (attn / shared FFN /
+             * embedding / output) into the GPU residency set and keep the routed
+             * experts reclaimable. The hot path still resolves every tensor's
+             * buffer; cold experts just are not pinned resident. */
+            ds4_model_map_span_vec bb, exp;
+            if (!weights_model_map_spans_split(&e->weights, &bb, &exp)) {
+                fprintf(stderr,
+                        "ds4: DS4_METAL_EXPERT_OFFLOAD requested but span split failed; "
+                        "falling back to the full-residency loader\n");
+                model_map_ok = ds4_gpu_set_model_map_range(e->model.map,
+                                                           e->model.size,
+                                                           e->model.tensor_data_pos,
+                                                           e->model.size - e->model.tensor_data_pos,
+                                                           e->model.max_tensor_bytes);
+            } else {
+                const uint32_t total = bb.len + exp.len;
+                uint64_t *offsets = xmalloc((size_t)total * sizeof(offsets[0]));
+                uint64_t *sizes = xmalloc((size_t)total * sizeof(sizes[0]));
+                bool *resident = xmalloc((size_t)total * sizeof(resident[0]));
+                uint64_t resident_bytes = 0, reclaimable_bytes = 0;
+                uint32_t n = 0;
+                for (uint32_t i = 0; i < bb.len; i++) {
+                    offsets[n] = bb.v[i].off;
+                    sizes[n] = bb.v[i].end - bb.v[i].off;
+                    resident[n] = true;
+                    resident_bytes += sizes[n];
+                    n++;
+                }
+                for (uint32_t i = 0; i < exp.len; i++) {
+                    offsets[n] = exp.v[i].off;
+                    sizes[n] = exp.v[i].end - exp.v[i].off;
+                    resident[n] = false;
+                    reclaimable_bytes += sizes[n];
+                    n++;
+                }
+                uint64_t split_max_tensor = bb.max_tensor_bytes;
+                if (exp.max_tensor_bytes > split_max_tensor) split_max_tensor = exp.max_tensor_bytes;
+                fprintf(stderr,
+                        "ds4: expert-offload model map: %.2f GiB backbone resident, "
+                        "%.2f GiB routed experts reclaimable (%u backbone + %u expert spans)\n",
+                        (double)resident_bytes / 1073741824.0,
+                        (double)reclaimable_bytes / 1073741824.0,
+                        bb.len, exp.len);
+                ds4_l1_budget_gate(resident_bytes, 0);
+                if (getenv("DS4_METAL_EXPERT_OFFLOAD_DEBUG") != NULL) {
+                    for (uint32_t i = 0; i < total; i++) {
+                        fprintf(stderr, "ds4:   span[%u] %s %.4f..%.4f GiB (%.1f MiB)\n",
+                                i, resident[i] ? "RES" : "exp",
+                                (double)offsets[i] / 1073741824.0,
+                                (double)(offsets[i] + sizes[i]) / 1073741824.0,
+                                (double)sizes[i] / 1048576.0);
+                    }
+                }
+                model_map_ok = ds4_gpu_set_model_map_spans_split(e->model.map,
+                                                                 e->model.size,
+                                                                 offsets,
+                                                                 sizes,
+                                                                 resident,
+                                                                 total,
+                                                                 split_max_tensor);
+                free(offsets);
+                free(sizes);
+                free(resident);
+                free(bb.v);
+                free(exp.v);
+            }
         } else {
+            ds4_l1_budget_gate(e->model.size - e->model.tensor_data_pos, 0);
             model_map_ok = ds4_gpu_set_model_map_range(e->model.map,
                                                        e->model.size,
                                                        e->model.tensor_data_pos,
@@ -18874,6 +19385,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     }
 #endif
 
+    ds4_profile_load_end();
     *out = e;
     return 0;
 }
@@ -18933,10 +19445,14 @@ void ds4_engine_close(ds4_engine *e) {
     ds4_gpu_cleanup();
 #endif
     ds4_release_instance_lock();
+    ds4_dist_tp_free(e->tp);
     free(e->directional_steering_dirs);
     free(e->directional_steering_file);
     free(e);
 }
+
+/* TP run loops (ds4_distributed.c) reach the engine's peer link through this. */
+ds4_dist_tp *ds4_engine_tp(ds4_engine *e) { return e ? e->tp : NULL; }
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
@@ -18973,6 +19489,41 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     }
     s->graph.quality = e->quality;
     s->graph.power_percent = (uint32_t)e->power_percent;
+    if (e->distributed.tp_enabled) {
+        /* Establish the TP peer link once per engine. By default the coordinator
+         * listens and the worker connects. DS4_TP_REVERSE_CONNECT=1 flips the
+         * network roles (coordinator connects, worker listens) to work around a
+         * host where one direction's connect() fails (observed: an M1 where ds4's
+         * outbound connect returns EHOSTUNREACH while nc/plain connect succeed).
+         * The TP all-reduce is a symmetric sum, so connect direction does not
+         * affect results; tp_owns_low stays tied to role, not to who listens.
+         * Blocks until both peers are up; KB-level buffers only. */
+        if (!e->tp) {
+            char terr[256] = {0};
+            const char *rev = getenv("DS4_TP_REVERSE_CONNECT");
+            bool reverse = (rev && *rev && rev[0] != '0');
+            bool coordinator = (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR);
+            bool i_listen = reverse ? !coordinator : coordinator;
+            if (i_listen) {
+                e->tp = ds4_dist_tp_listen(e->distributed.listen_host,
+                                           e->distributed.listen_port, terr, sizeof(terr));
+            } else {
+                e->tp = ds4_dist_tp_connect(e->distributed.coordinator_host,
+                                            e->distributed.coordinator_port, terr, sizeof(terr));
+            }
+            e->tp_owns_low = coordinator;
+            if (!e->tp) {
+                fprintf(stderr, "ds4: TP peer connection failed: %s\n", terr);
+                metal_graph_free(&s->graph);
+                free(s);
+                return 1;
+            }
+        }
+        s->graph.tp = e->tp;
+        s->graph.tp_layers = e->distributed.tp_layers ? e->distributed.tp_layers : UINT32_MAX;
+        s->graph.tp_owns_low = e->tp_owns_low;
+        s->graph.tp_vec = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    }
     if (!metal_graph_load_directional_steering(&s->graph,
                                                e->directional_steering_file,
                                                e->directional_steering_attn_scale,
@@ -18986,7 +19537,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->mtp_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->mtp_logits[0]));
         s->mtp_draft_token = -1;
     }
-    if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR) {
+    if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR && !e->distributed.tp_enabled) {
         char err[256];
         if (ds4_dist_session_create(&s->distributed,
                                     e,
@@ -19484,7 +20035,7 @@ static void ds4_session_note_prefill_progress(void *ud, const char *event, int c
  *
  * A non-matching prompt discards the checkpoint and prefills from token zero.
  */
-int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
+static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
     if (!s || !prompt || prompt->len <= 0 || prompt->len >= s->ctx_size) {
         snprintf(err, errlen, "prompt exceeds context");
         return 1;
@@ -19640,6 +20191,22 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     s->graph.mtp_n_raw = 0;
     return 0;
 #endif
+}
+
+int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
+    if (!g_prof.enabled) return ds4_session_sync_internal(s, prompt, err, errlen);
+    /* Tokens actually prefilled = prompt length minus the matching live prefix.
+     * Captured before the call because the internal sync mutates the checkpoint. */
+    const int start_len = (s && s->checkpoint_valid &&
+                           prompt && prompt->len >= s->checkpoint.len &&
+                           ds4_tokens_starts_with(prompt, &s->checkpoint))
+                          ? s->checkpoint.len : 0;
+    const double t0 = now_sec();
+    int rc = ds4_session_sync_internal(s, prompt, err, errlen);
+    if (rc == 0 && prompt && prompt->len > start_len) {
+        ds4_profile_add_prefill((uint64_t)(prompt->len - start_len), now_sec() - t0);
+    }
+    return rc;
 }
 
 /* Return true when canonicalization would replace already-sampled tokens.
@@ -19902,7 +20469,11 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
 }
 
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
-    return ds4_session_eval_internal(s, token, true, err, errlen);
+    if (!g_prof.enabled) return ds4_session_eval_internal(s, token, true, err, errlen);
+    const double t0 = now_sec();
+    int rc = ds4_session_eval_internal(s, token, true, err, errlen);
+    if (rc == 0) ds4_profile_add_decode(1, now_sec() - t0);
+    return rc;
 }
 
 /* Speculative decode state machine:

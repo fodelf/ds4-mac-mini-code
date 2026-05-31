@@ -84,6 +84,15 @@ typedef struct {
     uint32_t activation_bits;
     bool replay_check;
     bool debug;
+    /* Tensor parallelism (Stage 2 skeleton). Distinct from the layer-pipeline
+     * mode above: when tp_enabled, BOTH machines load the full layer stack and
+     * run in lockstep, splitting the MoE down_proj input (ff) dimension and
+     * summing partial [n_embd] outputs via an all-reduce over a dedicated TP
+     * socket. tp_layers caps how many leading layers use the TP split (the rest
+     * stay replicated) so the path can be brought up on 2-3 layers first. The
+     * existing role/listen/coordinator host:port fields select who listens. */
+    bool tp_enabled;
+    uint32_t tp_layers;
 } ds4_distributed_options;
 
 typedef struct {

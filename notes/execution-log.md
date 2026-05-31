@@ -1,0 +1,916 @@
+# DS4 Execution Log
+
+Project-local execution log. Every design memo / atomic patch / validation step /
+material scope decision / blocker gets a dated entry here (per standing rule).
+
+---
+
+## 2026-05-30 — Dual-host 200k / 20 t/s coding plan — investigation + physics (NEW plan, pre-params)
+
+**Context.** New goal, distinct from the single-machine 1M-ctx roadmap (Levers A/B/C).
+Two machines: Mac mini M4 16 GB (this host, budget ≤12 GB) + a MacBook 16 GB (budget ≤8 GB).
+Target: 200k ctx, **20 t/s**, Claude Code coding usage, prefer the q2-derived model, and
+above all **do not crash memory** (restraint over speed). Per `feedback_new_plan_forget_old_verdicts`,
+old NO-GO verdicts (X9, cb-floor) do not veto this; re-derived from scratch.
+
+**Hardware confirmed (this host).** Mac mini Apple M4, 10-core (4P+6E), 16 GB, ~120 GB/s
+theoretical mem bandwidth. `bridge0` Thunderbolt Bridge interface present (interconnect candidate).
+
+**Model inventory (`gguf/`).**
+- `DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf` = **80.76 GiB** (full q2; does NOT fit 20 GB combined → SSD paging → ~1 t/s, rejected).
+- **`ds4flash-k16.gguf` = 12.73 GiB** ← routing-concentration prune, 16 of 256 experts/layer resident, 95.6% routing hit (commit 78151b0 "feat: k16版本"). **The only model that fits combined RAM with no paging.**
+- `ds4flash-k48.gguf` = 21.80 GiB (48 experts/layer; exceeds 20 GB combined budget once KV+overhead added → rejected for these budgets).
+- `DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf` = 3.54 GiB (MTP draft model — the 20 t/s lever).
+
+**Flash architecture (ds4.c DS4_SHAPE_FLASH).** n_layer=43, n_embd=4096, n_hc=4 (mHC, 4 residual
+streams), MLA n_head=64 × head_dim=512, n_expert=256, n_expert_used=6, n_expert_shared=1,
+n_swa=128, indexer top-k=512, n_vocab=129280.
+
+**Memory budget (k16, no paging).** Per-layer k16 resident ≈ 12.73 GiB/43 ≈ 296 MB.
+mini ≤12 GB holds ~26 layers (7.7 GiB) + KV slice + runtime; macbook ≤8 GB holds ~17 layers (5.0 GiB).
+Both fit their share with headroom → **memory is NOT the binding constraint for k16**; the second
+machine is needed for capacity (k16 12.73 GiB > 12 GB mini budget), not for speed.
+200k KV (compressed attn): ~0.9–1.4 GiB total, split across hosts — trivial.
+
+**Decode physics (the 20 t/s wall).** Active read per token ≈ **9 GB**:
+attention Q8 ~5.7 GB (dominant, dense every layer) + shared-expert Q8 ~1.1 GB + 6 routed Q2 ~1.8 GB
++ output-proj Q8 ~0.56 GB. **Pipeline (layer-slice) parallelism splits MEMORY, not single-stream
+decode latency**: token flows mini→macbook serially, t = Σ(bytes_i / bw_i) ≈ 9 GB / ~100 GB/s
+≈ 90 ms → **~11 t/s ceiling**. Two machines ≈ same t/s as one machine that could hold it all.
+Inter-host wire = hidden state n_embd×n_hc = 4096×4 = 64 KiB F32/hop → negligible over Thunderbolt
+(prefill streams 200k×64KiB ≈ 12.8 GB once, ~2.5–10 s depending on TB gen — acceptable).
+
+**Paths to 20 t/s (only three physical levers).**
+- A. **MTP speculative decode** (3.54 GiB draft already in repo) — exact, no quality loss; coding
+  domain predictable; needs ~1.8× (11→20). Project currently labels MTP "experimental, slight
+  speedup" — making it deliver 1.8× in a distributed pipeline is the core engineering risk
+  (cf. FlowSpec / SpecPipe pipelined-speculative literature).
+- B. Attention Q8→Q4 re-quant (lossy) — saves ~2.8 GB/token → ~15 t/s; +experts 6→4 → ~17 t/s.
+  Violates AProjQ8 quality intent; needs re-quantization. Fallback only.
+- C. Tensor-parallel attention (both hosts compute same layer simultaneously): 9 GB / (bw_mini+bw_macbook)
+  ≈ 22 t/s — clears the gate, but 43 layers × 2 all-reduce/token requires **Thunderbolt 5 + RDMA
+  (macOS 26.2+, µs latency)**; without RDMA the per-layer sync (~ms) kills it. Project implements
+  pipeline only, not TP — major new work + mHC (n_hc=4) complicates the all-reduce.
+
+**Honest verdict (pre-params).** Capacity + 200k + no-crash: **solved by k16 + 2-host pipeline**.
+20 t/s: **NOT met by pipeline alone (~11 t/s)**; reaching it depends on MTP acceptance (lever A),
+or lossy quant (B), or TB5+RDMA tensor parallel (C). Per the ≥20 t/s iron gate, no execution until a
+credible ≥20 t/s path is fixed. Three decisive unknowns blocking the estimate: (1) MacBook chip
+(bandwidth + TB5/RDMA capability), (2) Thunderbolt link status/gen, (3) speed-vs-quality tolerance.
+
+**Status.** Investigation complete; design gated on user answers to the three unknowns. No model
+load, no build, no validation performed (memory-safety + no-validation-without-permission rules).
+
+### Update — params resolved (2026-05-30)
+- **Interconnect: Thunderbolt direct bridge already up.** Good for pipeline; but...
+- **Second host = MacBook M1 (base).** Mem bandwidth **68 GB/s theo (~50–55 real)** — half of M4.
+  Interface TB3/USB4 (NOT TB5) → no macOS RDMA → **tensor-parallel path C is dead** (per-layer
+  all-reduce at ms latency dominates). Pipeline-only.
+- **Speed/quality posture chosen: MTP-priority, lossless** (no attention Q4 re-quant).
+
+**Revised physics (M4 12 GB/~95 real + M1 8 GB/~52 real, TB3, pipeline, k16, 200k).**
+Second host is a *capacity patch*, not a speed-up: M4 alone can't hold k16 (12.73 GiB > 12 GB
+budget once KV+runtime added → crash risk), so M1 must take the overflow layers — and M1 is slow.
+Load M4 to its memory limit (~32–35 layers), M1 takes the remaining ~8–11 + MTP tail + sampling.
+- M4 ~35 layers: 35×0.196 + 0.56(output) = 7.42 GB / 95 = ~78 ms
+- M1 ~8 layers: 1.57 GB / 52 = ~30 ms ; TB hop ×2 negligible
+- **Base decode ≈ 108 ms → ~9–10 t/s.**
+- MTP speculative (lossless, DeepSeek ships 1 MTP module → ~1.8–2.0× ceiling in predictable coding
+  domain): **~16–19 t/s realistic-to-optimistic.**
+- Stackable lossless micro-levers (vocab-trim output 129k→64k frees M4 RAM for 1–2 more layers off
+  the slow M1; experts_used 6→5 coding-domain): nudge base ~9.3→~10.5 → with MTP graze ~19–20.
+
+**Verdict vs the ≥20 t/s iron gate.** On M4+M1, **lossless, I cannot produce a solid ≥20 t/s
+proof.** Honest ceiling ≈ **16–19 t/s** with MTP delivering ~1.8–2.0× AND M4 loaded to memory max
+AND lossless micro-levers stacked. 20 is the optimistic edge, not a guarantee. Gate NOT cleanly
+cleared → do not start build/execution until the user picks a posture:
+(1) accept ~15–17 t/s realistic target, or (2) allow one small lossy concession (e.g. experts 6→4,
+or attn Q6) to make 20 solid, or (3) faster second host. Capacity + no-crash + 200k remain SOLVED.
+
+**Sources consulted (web).** llama.cpp MoE SSD-offload PoC (Qwen3-30B-A3B @ M1 Pro 16 GB ~13 t/s);
+HOBBIT mixed-precision expert offload; EXO ring-pipeline over Thunderbolt (2-dev ~1.8×, RDMA µs
+latency on macOS 26.2+); FlowSpec / SpecPipe pipelined speculative decoding.
+
+---
+
+## 2026-05-30 (later) — REDESIGN: 投机解码 + 张量并行 (TP) + k4 smoke (user-directed)
+
+**Scope change (user).** New approved direction supersedes the pipeline-only plan above:
+主架构 = **投机解码 (spine) + 张量并行 over Thunderbolt**；允许 attention 重量化 Q8→Q5/Q4 (质量门把关)；
+最小集用 **k4**。明确"不复用 mine 分支的 replica/mtp-replica 架构"。Plan landed at repo `plan.md`.
+
+**Re old TP verdict (line 50-53, 66-68 above).** 上一轮判 "TP path C 在 M1+TB3 无 RDMA = 死"。
+那是**推测未实测**。按 `feedback_new_plan_forget_old_verdicts`，不让它否决，改用 **E0 实测**
+(en5 ping-pong all-reduce RTT) 作 TP go/no-go 闸。TP 每 token ~86 次逐层同步；RTT≤50µs→可行,
+≥150µs→回退单 M4+Q5+MTP。E0 是方案第一个动作。
+
+**Exploration verdicts (this session).**
+- **Verdict B — 必须物理重打包 k4，不能运行时 mask 全量。** `mac` 分支把专家张量整张(全256)
+  wrap 成单个 MTLBuffer + 进 MTLResidencySet (ds4_metal.m:14052; ds4_gpu_wrap_model_range:5009;
+  residency_request_views:424)。无逐专家 view-shrink、无 DS4_METAL_EXPERT_OFFLOAD。故运行时只用4个
+  专家**不减** footprint。
+- **离线工具可行。** gguf-tools/deepseek4-quantize.c 的 GGUF 读(load_gguf_metadata:1458)/写
+  (write_full_gguf:1620) 是流式 fseek+fread (不 mmap)；每专家是连续字节切片
+  (generate_one_expert memcpy at +xid*per_expert, :1240)。可写新工具流式切 top-K 专家、内存安全。
+- **k16 keep-map schema 破译** (dump_gguf_meta.py)：`deepseek4.expert_count` 仍=256；新增
+  `ds4.expert_keep_map.kept_counts:i32[43]`(=16) + `ds4.expert_keep_map.original_ids:i32[688]`
+  (43×16 原始id)；专家张量 dim[2]=16；门控 ffn_gate_inp 仍 256 列；前3层(hash) 另有
+  `ffn_gate_tid2eid.weight[6,129280]` 需一并处理。
+- **硬约束。** k4: expert_used 6→必须钳到 ≤4；门控可能选到未保留专家 → loader 须安全处理。
+
+**Blocker / decision needed.** 任何物理裁剪模型 (k4/k16/k48) 要**加载**都需 reduced-expert loader
+(`load_expert_keep_map` + 路由 remap)，该代码=mine 分支那套，与"不用 mine"冲突。已就此向用户提问
+(port-minimal-loader vs base-on-mine vs clean-room-rewrite)。已完成: plan.md 落地; gguf-tools 与
+runtime 残留度调研; k16 schema dump。未做: 任何模型加载/build/86GB 读取 (内存安全 + 待决策)。
+
+### 决策 + k4 文件已生成 (2026-05-30)
+- **用户定**: (1) loader = 移植最小 reduced-expert loader 到 mac (顺带让 k16/k48 可用); (2) k4 专家选 = 前4个最简 (smoke 质量非重点)。
+- **数据工具移植**: 从 mine 取 shrink_gguf.py + make_expert_mask.py 进 gguf-tools/ (纯数据工具,
+  流式 64MB, 不 mmap/不推理)。新写 make_firstk_mask.py (每层留专家 0..K-1)。
+- **k4 已生成并验证**: mask-k4 (每层 keep 0..3) → `gguf/ds4flash-k4.gguf` = **10.02 GB**,
+  10.8s, **峰值 RSS 198 MB** (内存安全实证)。元数据: expert_count=256(不变), expert_used=6(待 loader 钳到4),
+  ds4.expert_keep_map.kept_counts=[4×43] + original_ids=[0,1,2,3×43], 专家张量 dim[2]=4, tid2eid 逐字节拷贝(原始id)。
+- **物理验证**: 可行性报告实测 backbone(非专家)=86.72−77.91=**8.81 GB** (= 带宽地板, 吻合 ~8.85 估算);
+  专家 77.91GB→1.22GB。
+- **下一步**: 移植 loader (load_expert_keep_map + 路由 remap + expert_used 钳位 + GPU route_translate LUT),
+  然后 build + 单机 smoke 加载 (内存看门狗)。
+
+### ds4.c loader 移植完成 + 编译通过 (2026-05-30)
+- **决定**: 不钳 expert_used (tid2eid 张量是 [6,vocab], 钳了会和它 validation 冲突)。靠 keep-mask + route_translate(被丢→slot0) 优雅处理 kept(4)<used(6)。
+- **ds4.c 改动 (4 处, 全部编译通过, 0 error)**:
+  1. ds4_model 结构体加 expert_shrunken / expert_layer_count / expert_kept_count[] / expert_orig_to_compact[]。
+  2. 加 model_expert_kept_count() + model_expert_compact_slot() + load_expert_keep_map() (适配 mac 现成的 model_get_array/cursor API)。model_close 释放新分配。
+  3. model_open 在 parse_tensors 后调 load_expert_keep_map(m)。
+  4. weights_validate_layout(m, w): 专家张量检查改用 model_expert_kept_count(m,il); 调用点传 m。
+- **build**: `make` 全绿, ds4/ds4-server/... 全部链接成功。
+- **Metal 侧调研**: 路由 top-k 在 GPU (g_router_selection_buffer); 专家 matvec 用 _id_ kernel (g_moe_mul_mv_id_*) 按 id-map 索引; n_total_expert 来自专家张量 dim[2]=4 → **wrap=4×expert_bytes, 加载内存安全**; 但 id-map 用原始 id(0..255) 索引 4-专家张量会 GPU 越界 → 需 route_translate (metal/dsv4_misc 加 kernel_dsv4_route_translate + ds4_gpu_set_expert_keep_lut + 在 router 选择后/专家 matvec 前 wiring + load 时 set LUT)。GPU 越界被驱动沙箱化, 不爆 RAM/不 panic, 仅输出垃圾。
+- **未跑**: 任何 k4 模型加载 (遵守"改完等确认再运行"铁律, 待用户确认 + 13GB 看门狗)。
+- **已交付产物**: gguf/ds4flash-k4.gguf(10GB), plan.md, gguf-tools/{shrink_gguf,make_expert_mask,make_firstk_mask,dump_gguf_meta}.py, ds4.c loader 移植。
+
+### Stage 1a smoke 结果 — k4 单机加载 (2026-05-30, 用户确认后跑, 13GB RSS 看门狗)
+命令: `./ds4 -m gguf/ds4flash-k4.gguf --ctx 2048 --temp 0 -n 8 -p "1+1=?"`
+- ✅ **loader 工作**: 打印 "reduced-expert model: keep-map over 43 layers (min kept 4 of 256)", 无 exit(1)。
+- ✅ **内存安全**: 模型驻留 mapped **9554.67 MiB (~9.3GB)** (2 overlapping shared buffers); residency 请求 5930ms (页入 9.3GB); 机器无 OOM/无崩溃。
+- ✅ **管线跑通**: 43 层 GPU prefill + 生成全程正常; context buffers 197 MiB (ctx=2048)。
+- ✅ **基线速度**: **prefill 17.43 t/s, generation 10.58 t/s** (单 M4, k4)。
+- ⚠️ **输出垃圾** (重复 <bos>): route_translate 未补, 专家 id 索引错乱 → 预期内, 不崩不爆内存 (GPU 越界被驱动沙箱化)。
+- **关键发现 1 — 度量修正**: `ps -o rss` 只报 **38MB** (严重失真!), 因 Metal no-copy mmap (MAP_SHARED) 驻留不计入进程 anonymous RSS。**真实内存看门狗必须用 mach task_vm_info 的 phys_footprint, 不能用 ps rss**。这修正 plan Stage 0 看门狗的实现。
+- **关键发现 2 — 物理论点证实**: k4 只 4 专家 (专家计算极轻) 仍只 ~10.6 t/s → **瓶颈是 Q8 attention backbone 不是专家**, 与 plan 地基物理一致。TP 带宽聚合 + 投机 + Q5 重量化是攻地板的手段。
+- **下一步**: 补 GPU route_translate (metal kernel + LUT + wiring + load 时 set), 让输出正确; 然后才有意义跑 ds4-eval 质量 / 多 token 速度。
+
+---
+
+## 2026-05-30 — plan.md 拆分为有序 task 清单 (scope/planning)
+
+**动作.** 按用户要求把已批准的 `plan.md` 拆成有序、可独立验收的 task,落地到 `task/` 目录(纯文档,
+不动代码/不加载模型)。
+
+**拆分结果 (8 task + 索引).**
+- `task/README.md` — 索引: 执行顺序、依赖表、关键闸门 (E0 / TP 对拍 / 质量门 / 内存闸 / ≥20t/s 铁律)、模型实数。
+- `01-gpu-route-translate.md` — 让 k4 输出正确 (metal kernel + LUT + wiring + load 时 set)。前置: Stage 1a 已完成。
+- `02-stage0-profiling-watchdog.md` — DS4_PROFILE 计时 + phys_footprint 看门狗 + L1 预算闸。基础设施。
+- `03-stage1b-calibration.md` — 单机标定地板 + MTP 收益 + 200K 内存外推。前置: #01,#02。
+- `04-e0-thunderbolt-allreduce-bench.md` — 雷电 all-reduce RTT 基准 = TP go/no-go 闸。前置: #02。
+- `05-stage2-tp-skeleton.md` — 最小 TP (只切 down_proj + 1 all-reduce)。前置: #04 通过。
+- `06-stage3-full-tp-expert-parallel.md` — 全层 TP + 专家并行 + 装载策略。前置: #05。
+- `07-stage4-attn-requant-q5.md` — attention Q8→Q5/Q4 离线重量化 + 质量门。前置: #03。
+- `08-stage5-speculative-200k.md` — MTP 叠加 + 200K + 逼近 20 t/s + 备选路线。前置: #06,#07。
+
+**顺序依据.** 单机线 (#01→#02→#03) 不依赖雷电,先打通+标定; E0 (#04) 是 TP 总闸,gate 住 #05–#06;
+#07 离线量化可与 #06 并行; #08 集成收尾。每个 task 含: 目标/前置/落点(file:line)/步骤/闸门/内存安全/
+验证命令/产出,与 plan 各 Stage 一一对应。
+
+**状态.** 仅写文档。未编译、未加载模型、未做任何验证 (遵守内存安全 + 改完等确认铁律)。
+plan.md 进度 checklist 不变,仍为单一事实源; task/ 是其可执行展开。
+
+---
+
+## 2026-05-30 — 开始 Task 01 (GPU route_translate): 摸清落点 + 工具损坏 BLOCKER
+
+**动作.** 用户指示: 给 task 索引加「完成状态」列(已加, 图例 ⬜/🔄/🟡/✅/⛔), 然后按序从 #1 开始干活,
+干完更新状态并等指令。开始 Task 01。
+
+**已确认代码事实(grep 多次交叉一致, 可信).**
+- `selected`(原始 id 0..255) 由 `ds4_gpu_router_select_tensor`(ds4_metal.m:13798)/`_batch_tensor`(:13893)
+  写入 `g_router_selection_buffer`(:122)。
+- 消费方 `ds4_gpu_routed_moe_one_tensor`(:13989) 与 `_batch_tensor`(:14296) **均带 `layer_index` 形参**;
+  用 `g_moe_mul_mv_id_*`(:72-80) 按 id 索引专家张量(k4 仅 4 行)→ 越界根因。
+- 实现锚点: 两函数取出 `selected` 后、构造 mul_mv_id 前, 插一次新 kernel `kernel_dsv4_route_translate`
+  原地把 `selected` 改写为 compact slot(gate/up/down 复用同一 selected, :14524 注释佐证)。
+- LUT 源 = host `m->expert_orig_to_compact`(ds4.c:1159, `[layer*256+orig]→slot/-1`), `load_expert_keep_map`
+  (ds4.c:1377) 填; 新增 `ds4_gpu_set_expert_keep_lut` 在 model_open(ds4.c:1616 后)上传; kernel `slot<0→0`。
+- kernel 模板 = `kernel_dsv4_router_weights_one`/`_finalize_one`(metal/dsv4_misc.metal:105/115)。
+
+**BLOCKER (本次会话工具层间歇性损坏 Read 输出).** 证据: (1) 读 ds4_metal.m 返回**乱序行号**
+(14015 早于 14012)——Read 是 cat -n 顺序, 不可能乱序; (2) 结果尾部被追加伪造的 `<result name=System>`
+块+畸形 `<parameter name=3>` 标签, 非 harness 真实行为; (3) 出现"凑巧已存在"的伪造注释
+(// see route translate below); (4) 早前 /tmp 文件一度返回 `?? out of memory` 等垃圾。复读小范围
+(14008-14019)干净且与 grep 一致, 但尾部(14020-14022)又引用未声明变量——**间歇性拼接, 不稳定**。
+
+**裁决.** 不在工具输出损坏期间盲改 Metal 推理核心: (a) Edit 需精确匹配真实字节, 且即便匹配成功也会基于
+被拼接/伪造的上下文心智模型放错位置, 违反 correctness-before-speed 铁律; (b) 改完按铁律也无法运行验证,
+本轮无论如何无法真正"完成" #1; (c) 盲改 14k 行文件有损坏真实源码风险。故: 未改码、未编译、未运行。
+Task 01 置 🔄 进行中(已记录全部落点, 恢复后可直接据 task/01「进展」逐处即时重读→Edit→异常即停)。等用户指令。
+
+### 续 — 工具短暂恢复, 落地一半 wiring; 工具再次崩(返回空)后停手 (2026-05-30)
+
+**用户确认.** LUT 传递方式 = 常驻 GPU buffer + 全局 kernel(AskUserQuestion 选项 1)。
+
+**已落地(7 处 Edit, 每处精确唯一匹配 = 可信, Edit 安全-by-construction):**
+1. metal/dsv4_misc.metal: `struct ds4_metal_args_dsv4_route_translate` + `kernel_dsv4_route_translate`(orig id→compact slot, 丢弃/越界→slot0)。
+2. ds4_gpu.h: 声明 `ds4_gpu_set_expert_keep_lut` + `ds4_gpu_translate_expert_ids`。
+3-5. ds4_metal.m: 全局 `g_dsv4_route_translate_pipeline`+`g_expert_keep_lut_buffer`+`g_expert_keep_lut_layers`;
+   init 获取 pipeline + 加入校验链; teardown(一处) pipeline=nil。
+
+**未做(工具崩):** ds4_metal.m 两函数体(需读 CB/residency 约定); ds4.c set LUT + 两处插 translate
+(decode :10739 / prefill :13585); g_expert_keep_lut_buffer teardown nil; make; run。详见 task/01「当前代码状态」。
+
+**⚠️ 树处于半 wiring 态, 可能不 build 干净**(未用 static 变量 + 两个无定义声明; 若 -Werror -Wunused 则断)。
+明确不宣称可编译。补完 #6-#9 才干净。
+
+**正确性已核验:** translate 必须在 router_select 后(weights 已用原始 id 算完); 前3层 hash 与 topk 同写
+一个 selected, 统一翻译覆盖。设计安全。
+
+**工具故障升级证据:** Read 从乱序/拼接 → 返回空; `sed -n` 空; 连 `echo probe-$(date)` 都空输出。
+非内容问题, 是工具层传输崩。无法读=无法拿 CB 约定锚点, 无法 build 验证 → 按 correctness-before-speed
+铁律停手, 不盲改 14k 行推理核心。等工具恢复的会话/轮次继续(据 task/01 清单逐处即时重读→Edit→make 兜底)。
+
+### 续 2 — 工具恢复, Metal 侧全部完成; ds4.c wiring 时工具再崩, 停手 (2026-05-30)
+
+**纠正上一条的过度悲观.** 工具恢复后复读干净且自洽, 之前的"空输出"多为回显竞争, Edit 其实都成功了。
+拿到完整 CB/encoder/buffer 样板(ds4_gpu_command_buffer:249 / compute_encoder / end_compute_encoder /
+finish_command_buffer:297 / ensure_scratch_buffer:325 / newBufferWithBytes / tensor_offset:743)。
+
+**Metal 侧 100% 完成(6 处 Edit, 全部精确唯一匹配):**
+- 在 ds4_gpu_router_select_tensor(:13807) 前实现 `ds4_gpu_set_expert_keep_lut`(newBufferWithBytes 建 Shared
+  常驻 LUT, n_layer×256 int16 ≈21KB, 替换旧) + `ds4_gpu_translate_expert_ids`(无LUT→return1 no-op;
+  越界layer报错; 否则 CB→encoder→setBytes args(0)/setBuffer lut(1)/selected(2)→dispatchThreads(n_tokens×
+  n_expert_used)→end→finish)。
+- teardown 补 g_expert_keep_lut_buffer=nil + layers=0。
+- helper 全验证存在(tensor_offset/_bytes/_hot_pipeline/command_buffer/finish_command_buffer)。
+- 设计: LUT 是独立 21KB 小常驻 buffer, 不进 model residency set(那是给 mmap 模型视图的); setBuffer 绑定的
+  Shared buffer Metal 自动 wire。host LUT 格式 m->expert_orig_to_compact(int16[layer*256]) = kernel 期望格式, 直传。
+
+**仅剩 ds4.c 3 处(被工具二次崩阻塞):**
+7. model_open(:1614 load_expert_keep_map 后) 若 expert_shrunken 调 set_expert_keep_lut 上传 LUT。
+   **未决点: 必须先查 ds4.c 怎么用 #ifdef DS4_NO_GPU 守 GPU 调用(CPU build 不能调)**——这正是工具崩时
+   想 grep 的(grep DS4_NO_GPU 返回 `?? out of memory` 伪输出)。
+8. decode metal_graph_ffn_layer(:10739) 插 translate_expert_ids(g->router_selected, il, USED, 1, kept_count)。
+9. prefill(:13585) 插 translate_expert_ids(g->batch_router_selected, il, USED, n_tokens, kept_count)。
+
+**裁决.** Metal 侧自闭合、可信。ds4.c 三处需先读清 #ifdef 守卫 + 两个 graph 函数局部(ok 变量/model 变量名)
+才能写精确 Edit; 工具正返回 `?? out of memory`/`...`省略/伪造行/行号乱序, 读不可信。**不在读损坏期盲改
+16k 行推理核心**(误放 GPU 调用进 CPU build, 或放错 ok 链都会坏)。未 make、未运行。Task 01 仍 🔄(Metal 完成,
+ds4.c 待)。等工具稳定继续。当前树: k4 行为不变(仍输出垃圾, 因 translate 还没被调用)——非回归。
+
+### 续 3 — 关键架构发现: 需补 CPU 参考实现; 工具三次崩, 收尾 (2026-05-30)
+
+**关键发现(grep 短暂可用时拿到, 可信).** ds4.c 全文仅 3 行提 DS4_NO_GPU(:20-22, 仅 backend 名)。
+调用点**无 ifdef 守卫** → `ds4_gpu_*` 符号在 GPU build 来自 ds4_metal.m/cuda, **CPU build 来自 ds4.c 内 CPU
+参考实现**(CLAUDE.md 印证)。**推论: 必须在 ds4.c CPU 参考段补 set_expert_keep_lut + translate_expert_ids
+的 CPU 版, 否则 CPU build 链接缺符号。** translate CPU 版大概率 no-op(CPU routed_moe 参考可能已用
+model_expert_compact_slot 翻译)——动手前需读 ds4.c CPU 参考段确认。这把 ds4.c 待办从 3 处增到 4 处(+CPU stub)。
+
+**工具状态.** 三次崩(grep -c / true;echo 均返回空)。这是本会话工具层硬阻塞, 重试无效, 不可预测。
+
+**本会话产出小结(已落盘, 可信):**
+- task/ 8 个 task + README 索引(带完成状态列) ✓
+- Metal 侧 route_translate 完整(kernel + 2 函数体 + 全局/init/teardown wiring), 6 处精确 Edit ✓
+- ds4_gpu.h 2 声明 ✓
+- 全部落点 + CPU 参考实现待办 + 验证步骤记录在 task/01「当前代码状态」, 恢复即可续
+- **未做: ds4.c 4 处(set LUT + decode/prefill translate + CPU 参考 stub)、make、run**
+- 当前树非回归(translate 未被调用, k4 行为同 Stage 1a)
+
+**恢复后第一步(给下一个会话/轮次):** grep `ds4_gpu_router_select_tensor` 的**定义**(在 ds4.c CPU 参考块)
+定位 CPU stub 落点 → 读两个 graph 函数(:10561 metal_graph_ffn_layer / prefill :13556 区)局部 ok/model 变量
+→ 逐处即时重读→Edit→make 兜底→等用户确认跑 k4。
+
+### 续 4 — 工具恢复, Task 01 代码完成 + make 全绿 (2026-05-30) ✅代码
+
+**纠正"需 CPU stub"判断(续3过度推断).** python 预处理器分析(权威): 4 个 graph 调用点(decode :10719/10740,
+prefill :13556/13587)**全在 `#ifndef DS4_NO_GPU`(8761 大块)内** → CPU build 不编译 → **无需 CPU stub**。
+`grep -c ds4_gpu_router_select_tensor ds4.c`=1(仅调用点) 证实 CPU 走独立 forward_token_*_cpu 路径, 不用同名
+ds4_gpu_* 符号。只有 set-LUT 在 model_open(全 build 编译) 故加 #ifndef DS4_NO_GPU 守卫。
+
+**ds4.c 3 处落地(精确 Edit, 已 Read 复核位置):**
+- :1617 model_open load_expert_keep_map 后, #ifndef DS4_NO_GPU 内, expert_shrunken → ds4_gpu_set_expert_keep_lut
+  (m->expert_orig_to_compact, m->expert_layer_count), 失败 ds4_die。
+- :10746 decode metal_graph_ffn_layer router 后/moe_one 前: if(ok&&model->expert_shrunken) translate
+  (g->router_selected, il, USED, 1, model_expert_kept_count(model,il))。
+- :13595 prefill router 后/moe_batch 前: 同上 (g->batch_router_selected, ..., n_tokens, ...)。model 变量名确认
+  (:13374 const ds4_model *model)。
+
+**编译验证(ground truth, 已纠正不诚实表述):** `make` 链接成功(ds4/server/bench/eval/agent 全部重链), 但
+**有 1 个警告**(我先前误写"0 warning", 错): `ds4.c:1365 unused-function 'model_expert_compact_slot' [-Wunused-function]`。
+GPU 路径改用 GPU 内 LUT 翻译 → host model_expert_compact_slot() 没人调了(Stage 1a loader 移植时加的)。
+不影响链接(5 binary 都生成), 但违反干净-build。处理选项待用户定。
+(另: ds4.c:5385 clang-tidy integer-division 是会话前已存在的未提交改动, 非本 task 引入。)
+
+**完整实现清单(8 处 Edit, 全编译通过):** kernel+args(misc.metal) / 2 声明(gpu.h) / pipeline+buffer+layers 全局
+(metal.m) / init 获取+校验 / teardown 清零 / set_expert_keep_lut+translate_expert_ids 函数体(metal.m) /
+set-LUT(ds4.c model_open) / decode+prefill translate(ds4.c)。
+
+**设计正确性:** translate 在 router_select 后(weights 已用原始 id 算完); 前3层 hash 与 topk 同写一个 selected
+统一翻译; 全模型双保险 no-op(LUT 未设 + expert_shrunken 守卫) 零开销; LUT 21KB 独立小常驻 buffer 不进 model
+residency set, setBuffer 自动 wire。
+
+**裁决: Task 01 → 🟡 代码完成·编译全绿。仅剩运行验证**(./ds4 -m k4 -p "1+1=?" 看是否输出连贯),
+**需用户确认 + 13GB phys_footprint 看门狗**(内存安全 + no-validation-without-permission 铁律, 改完等确认再跑)。
+当前树: 全模型路径零影响(双 no-op 守卫); k4 路径加了 id 翻译(待运行验证是否修复垃圾输出)。等用户指令跑验证。
+
+**关于工具:** 本会话 Bash stdout echo 间歇性丢失/串字(grep 输出残缺/伪造行), 但 Read 文件稳定可靠, Edit
+精确匹配安全。策略已切到 "命令重定向到 /tmp 文件 → Read 读回", 绕过 echo 故障, 验证可信。
+
+---
+
+## 2026-05-30 — 装载架构重构 A1: 选择性热集驻留 (用户驳回"全量驻留", 要求懒加载/分批)
+
+**用户裁决.** "不管内存是否够, 一次加载所有模型的方式毫无扩展性, 设计有问题, 必须重新改, 分批/懒加载等机制。"
+中止 Task 01 运行验证, 转做装载架构。plan mode 出方案, 用户批准: 路线 A(per-tensor view-shrink+懒驻留)先做
+A1(最小改动) 验证物理效果, 不行再 A2; 验证先 k4 验逻辑再大模型验价值。计划存
+~/.claude/plans/memoized-frolicking-blum.md。
+
+**根因(已读清 file:line).** ds4.c:19031 全量分支把 [tensor_data_pos, size) 整段传 set_model_map_range →
+ds4_metal.m:472 add_model_view_range 切巨型覆盖视图(backbone+专家交错同盖) → :435 request_views 全量
+requestResidency → 整模型 wire(k4 实测 9.3GB)。CUDA 侧 ds4.c:1754 已用 "_exps." 跳过冷专家只缓存 backbone,
+Metal 无等价物。
+
+**关键发现.** (1) 现成机制可复用: weights_model_map_spans(ds4.c:3303)+model_map_span_vec_*(:3229)+
+set_model_map_spans(ds4_metal.m:4955, layer-slice 分布式在用)。(2) wrap_model_range(ds4_metal.m:5040)找不到
+覆盖 view 就 nil→崩, 所以冷专家必须仍 wrap(只是不 request residency)。(3) 装载分支在 #ifndef DS4_NO_GPU
+(ds4.c:18863)内, CPU build 不碰 → 无需 CPU stub。本地有 k4/k16/k48/全量, 大模型验证有料。
+
+**A1 实现(8 处 Edit, make 0 warning/0 error, 5 binary 22:17 重链):**
+- ds4_metal.m: g_model_views 加 resident_hint(:208); add_model_view_range 加 bool resident 参数(2 调用点传 true);
+  request_views 只 add resident_hint 的 view + 统计驻留数; set_model_map_spans 重构为 _impl(带可选 resident_flags[],
+  NULL=全驻留=旧行为) + 旧接口转调 NULL + 新 set_model_map_spans_split(要求非 NULL flags)。
+- ds4_gpu.h: set_model_map_spans_split 声明 + 语义注释。
+- ds4_cuda.cu: split 等价实现(忽略 flags, 转调普通 spans; CUDA 冷专家已走 UVA fallback)。
+- ds4.c: 新增 model_map_span_vec_split_layer(专家张量→expert 组, 其余含 shared expert→backbone 组, 按字段不靠名)
+  + model_map_span_vec_finalize + weights_model_map_spans_split; ds4_engine_create 全量分支加
+  `else if DS4_METAL_EXPERT_OFFLOAD` 路径: split→拼 offsets/sizes/resident_flags→调 _split, 打印
+  "X GiB backbone resident, Y GiB experts reclaimable"; 默认/split 失败回退原 range 调用 = 零回归。
+
+**设计要点.** 默认行为 byte-for-byte 不变(env 不设走旧 range)。专家仍被 wrap(热路径不 nil), 只是不进
+residency set → file-backed 干净页可被内核 VM 压力回收。shared expert 归 backbone(每 token 必用)。
+
+**A1 是"软"控制(诚实).** 靠内核回收非驻留页, 不保证物理页一定换出; 巨型 view(其实 split 后是 backbone/expert
+分开的 view)仍占 VM 地址空间。够不够要 k4 实测 footprint 才知道 → 不够再上 A2 逐张小 view 硬控制。
+
+**状态: A1 代码完成·make 全绿。待运行验证**(对比默认 vs DS4_METAL_EXPERT_OFFLOAD=1 的 k4 加载 phys_footprint),
+需用户确认 + 13GB 看门狗。这次验证可同时确认 Task 01 route_translate 输出是否连贯(两件事一次跑)。
+
+### A1 验证 (2026-05-30, 用户确认后跑, 13GB 看门狗) — 装载机制通, 暴露 2 个遗留 bug
+
+**第一跑 (DS4_METAL_EXPERT_OFFLOAD=1) 报错 not-covered.** prefill 卡 layer 19:
+`Metal model range 0.50..1.15 GiB is not covered by mapped model views`, out 0 字节。
+
+**逐层诊断 (加诊断打印, 解析 GGUF 张量目录, 3 次加载实测) 锁定根因:**
+- GGUF 布局其实很干净(非交错!): token_embd[0..8.7MiB] → 全部专家[8.7MiB..1.14GiB] → 全部 backbone[1.14GiB..9.33GiB]。
+  backbone/expert merged span 零重叠。host split 分组**正确**。
+- 真因 = **wrap 请求 [532901664, 1237544736) 跨度 704MB 越界**。routed_moe 内 gate_tensor_bytes =
+  n_total_expert × gate_expert_bytes(ds4_metal.m:14215)。host 两调用点(decode ds4.c:10855 / prefill :13713)
+  传 `DS4_N_EXPERT`(=256), 但 k4 张量实际只 4 专家 → wrap 范围比真张量大 64×, 冲进 token_embd 区。
+- **全模型路径下此 bug 不暴露**(整 tensor-data 是一个连续 view, 越界 wrap 仍落在大 view 里; GPU 按 route_translate 限定的 id∈[0,4) 索引不真读越界)。**只有 A1 split 成多 view 后才暴露成 not-covered。** 这是
+  Task 01/reduced-expert loader 的遗留正确性 bug。
+
+**修复 (2 处 Edit):** ds4.c:10855 + :13713 的 `DS4_N_EXPERT` → `model_expert_kept_count(model, il)`。
+全模型零回归(无 keep-map 时该函数返回 DS4_N_EXPERT=256, ds4.c:1357)。make 0 warning。
+
+**第二跑 (修复后):** ✅ not-covered 消失; 全 43 层 prefill + 16 token 跑通 exit 0; 91 view(90 res+1 non-res);
+**residency 请求 2372ms→322ms(只 wire backbone, 快 7×, 间接证明只驻留热集)**; prefill 17.60 / gen 9.36 t/s。
+
+**⚠️ 两个未了结:**
+1. **footprint 硬数据没拿到** — 看门狗用 footprint -p 采样但没记峰值数字; mapped 9556MiB 是标称 view 映射不是
+   物理驻留。A1 核心目标(证明物理内存真降)**尚无硬数据**, 需补测对比默认 vs offload。
+2. **输出仍垃圾**(`packfully`+空白) — Task 01 route_translate 没真正修好 k4 输出。n_total_expert 修复让范围对了
+   不崩了, 但专家计算链路仍有错。
+
+**诚实裁决: A1 装载机制通了(not-covered 灭, residency 只请热集), 但 (a) 没用 footprint 硬证物理内存降幅,
+(b) route_translate 输出正确性仍坏。两者都要继续。不宣称 A1 成功, 只说"机制跑通, 待硬数据 + 输出修复"。**
+
+### 续 5 — 清死代码, make 0 warning (2026-05-30) ✅代码完成
+
+**用户定:** 删 model_expert_compact_slot(选项1)。GPU 路径用 GPU 内 LUT 翻译, 该 host 函数已死代码。
+**改动:** 删 ds4.c:1362-1371 model_expert_compact_slot()(连注释)。expert_orig_to_compact 表仍由
+load_expert_keep_map 填(将来 CPU 参考翻译可重建)。
+**重 make:** 0 warning / 0 error, ds4.o 重编 + 5 binary 重链, grep 确认 model_expert_compact_slot=0 残留,
+route-translate 符号在 ds4.c/metal.m/gpu.h 各 3 处完整。(ds4.c:5374 integer-division 是会话前已存在改动, 行号
+随删函数从 5385 漂到 5374, 与本 task 无关。)
+
+**Task 01 状态: 🟡 代码完成·make 全绿。唯一剩余 = 运行验证**(./ds4 -m gguf/ds4flash-k4.gguf --ctx 2048
+--temp 0 -n 32 -p "1+1=?" 看输出是否连贯/不再重复 BOS), **需用户确认 + 13GB phys_footprint 看门狗后才跑**
+(no-validation-without-permission + 内存安全铁律)。等用户指令。
+
+---
+
+## 2026-05-30 — 开始 Task 02 (Stage 0 计时+看门狗): 读取层主动拼接, 停手 (BLOCKER)
+
+**动作.** 用户指示跳到 Task 02。建 4 个子任务跟踪 (DS4_PROFILE 计时 / phys_footprint 看门狗 /
+L1 静态预算闸 / make+文档)。开始摸锚点。
+
+**已拿到的可信事实 (grep 与小文件 Read 多次一致).**
+- `now_seconds()` @ds4.c:715 (clock_gettime CLOCK_MONOTONIC); `DS4_MTP_TIMING` @20258; `DS4_TIMING`
+  打印 model load 时间的先例在 ds4_engine_create 内。
+- **全代码库无 task_vm_info/phys_footprint/task_info 使用** → 看门狗要新写 (+`#include <mach/mach.h>` __APPLE__ 守卫)。
+- `#include <pthread.h>` @:24, pthread_create @:930 (看门狗线程有基建)。
+- 锚点: model_open @2391, model_close @2589, ds4_engine_create @2600(t0/t1 已在), 调用
+  `ds4_engine_create_gpu_model` @2614, 其定义 grep 报 @2841。
+
+**BLOCKER — 读取层主动拼接伪造函数体 (本会话再现, 决定性证据).**
+- ds4_engine_create(@2614) 把 `ds4_engine_create_gpu_model(...)` 返回值赋给 `ds4_model *m`, 但
+  @2841 读到的定义却 `int ds4_engine_create_gpu_model(...)` + 可疑 `_finish` helper → 类型矛盾 (C 不可能编译)。重试稳定复现。
+- 决定性: offset-700 读把 `ds4_thread_count()` 体显示成 now_seconds 的 clock_gettime, 但干净 grep
+  明确 ds4_thread_count 真实体是 `getenv("DS4_THREADS")`(:725)。**读取层把 A 函数体拼进 B 函数 → 连"自洽"的读取都不可信。**
+- 另: grep→/tmp→cat 大输出截断; Read 同一 /tmp 文件多匹配截断; 源码 offset 读间歇空/截断/拼接。
+
+**裁决 (correctness-before-speed + 执行日志续2/续3 既定规则).** 不在读取损坏期盲改 16k 行推理核心:
+即便 Edit 精确匹配或失败 (安全), 但围绕上下文的心智模型建立在被拼接的读取上 → 会把增量代码放错作用域。
+**本会话零 Edit, 磁盘源码完好 (未改=不可能回归), 仅创建 4 个跟踪 task + 2 个 /tmp 探针文件。**
+
+**Task 02 诚实切分 (恢复后直接据此落地).**
+- 本轮推迟全部代码改动 (读不可信)。
+- 读稳后**先落安全增量** (锚点已交叉验证): (a) phys_footprint helper + 200ms 看门狗线程 +
+  DS4_MEM_BUDGET_MB env + 峰值记录 + 超 budget×0.9 abort (头号诉求"绝不爆内存"); 落点 now_seconds(:715)
+  后建自包含模块, 看门狗在 ds4_engine_create(:2600) 顶部 start, atexit flush。(b) DS4_PROFILE 加载墙钟+
+  footprint 增量 (engine_create 已有 t0/t1) + CSV 汇总行。
+- **依赖 GPU residency 内部 (当前读不可信) 的推迟**: L1 起飞前预算闸 (需 create_gpu_model 内 requestResidency
+  前落点) + 逐 chunk/逐 token CSV 行 (需 prefill/decode 热循环锚点)。读稳能交叉验证 create_gpu_model 真实签名后再补。
+
+**make/运行.** 本轮未 make、未运行、未加载模型。运行验证仍需用户确认 + 看门狗 (内存安全铁律)。
+
+### 续 — 读取损坏经实测确认 (grep/Read/小窗口全中招), 持久化可落地设计, 停手 (2026-05-30)
+
+**纠正上一条措辞.** 上条"主动拼接"判断方向对, 但本会话经多轮实测细化为: **读取层对任何稍大输出
+间歇性重复/拼接行** —— 决定性证据: (1) Read offset18900 把 model_open 同时显示在 18924 与 18929
+(权威 grep 只 18929/18945), 且 18921 的 g_engine_active_backend 在 18930 重复; (2) 小至 10 行的
+Read(716-725) 把 now_sec 唯一的 return 复制成两行(721+722); (3) grep stdout 把 prefill 块整段重复、
+丢失 eval/model_open 段。结论: **小范围 grep -n 行号可信, 但行内容与任何 Read 都可能被复制 → 构造
+不出可信的 Edit old_string, 且 make stdout 同样损坏无法验证 → 不改源码 (铁律)。** 注: Bash 文件写
+(heredoc >>) 可靠, 仅 stdout 回读损坏。
+
+**本会话零源码改动. 已交付: 4 个跟踪 task + 本日志设计. 树干净 (git status 仅原有 5 M + 未跟踪), 无回归.**
+
+**Task 02 锚点 (grep 多次交叉一致, 可信):**
+- `now_sec()` @ds4.c:718-722 (clock_gettime CLOCK_MONOTONIC, 单 return) ← 模块插入点 (其后)。
+- 全库无 task_vm_info/phys_footprint → 新写。`DS4_MAYBE_UNUSED` 定义在 ds4.h:21 (ds4.c:39 引入, 722 处可用)。
+- 接线点 (下轮读稳后逐处小窗口重读再 Edit): model_open def@1561 (load 计时+看门狗已由构造函数覆盖, 可不改);
+  `ds4_session_eval`@20186 (3 行, 调 _internal → 包计时 add_decode); `ds4_session_prefill`@19726 /
+  `_internal`@19737 (包计时 add_prefill)。L1 静态闸需 engine_create residency 区 (@~18990-19113, 正读坏) → 推迟。
+
+**可直接落地的自包含模块 (插在 ds4.c now_sec() 之后, 零热路径依赖; 构造函数自启覆盖加载期 OOM):**
+
+```c
+/* ---- Stage 0: phys_footprint 看门狗 + DS4_PROFILE 计时 (见 task/02) ----
+ * 看门狗: 200ms 采样 Mach phys_footprint(非 ps/rss, 后者对 Metal no-copy mmap 失真,
+ *   9.3GiB 驻留只报 ~38MiB), 记峰值; DS4_MEM_BUDGET_MB 设了则越 90% 预算前 _exit 防 thrash。
+ *   构造函数自启 → 覆盖整进程(含模型加载大 mmap+residency), 不碰任何热路径。
+ *   DS4_MEM_BUDGET_MB / DS4_PROFILE 都没设 → 一次 getenv 后返回, 不起线程 = 零开销。
+ * DS4_PROFILE: load/prefill/decode 墙钟, atexit 输出单行 CSV 到 DS4_PROFILE_FILE(或 stderr)。 */
+#if defined(__APPLE__)
+#include <mach/mach.h>
+static uint64_t ds4_phys_footprint_bytes(void) {
+    task_vm_info_data_t info; mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &count) != KERN_SUCCESS) return 0;
+    return (uint64_t)info.phys_footprint;
+}
+#else
+static uint64_t ds4_phys_footprint_bytes(void) { return 0; }
+#endif
+static const double DS4_GIB = 1024.0 * 1024.0 * 1024.0;
+static pthread_t         g_mem_watch_thread;
+static volatile int      g_mem_watch_run = 0;
+static int               g_mem_watch_started = 0;
+static uint64_t          g_mem_budget_bytes = 0;
+static volatile uint64_t g_mem_peak_footprint = 0;
+typedef struct { int inited, enabled; const char *csv_path;
+    double load_sec; uint64_t load_footprint_delta;
+    uint64_t prefill_tokens; uint32_t prefill_chunks; double prefill_sec;
+    uint64_t decode_tokens; double decode_sec; } ds4_profile_state;
+static ds4_profile_state g_prof;
+static DS4_MAYBE_UNUSED double   g_prof_load_begin_sec;
+static DS4_MAYBE_UNUSED uint64_t g_prof_load_footprint_begin;
+static void ds4_profile_init(void) {
+    if (g_prof.inited) return; g_prof.inited = 1;
+    g_prof.enabled = getenv("DS4_PROFILE") != NULL;
+    g_prof.csv_path = getenv("DS4_PROFILE_FILE");
+}
+static void ds4_profile_flush(void) {
+    if (!g_prof.enabled && !g_mem_watch_started) return;
+    uint64_t peak = g_mem_peak_footprint, now = ds4_phys_footprint_bytes();
+    if (now > peak) peak = now;
+    double ptps = g_prof.prefill_sec > 0.0 ? (double)g_prof.prefill_tokens / g_prof.prefill_sec : 0.0;
+    double dtps = g_prof.decode_sec  > 0.0 ? (double)g_prof.decode_tokens  / g_prof.decode_sec  : 0.0;
+    FILE *f = stderr; int close_f = 0;
+    if (g_prof.csv_path && g_prof.csv_path[0]) { FILE *cf = fopen(g_prof.csv_path, "a"); if (cf) { f = cf; close_f = 1; } }
+    fprintf(f, "ds4_profile load_sec=%.3f load_footprint_gib=%.3f "
+        "prefill_tokens=%" PRIu64 " prefill_chunks=%u prefill_sec=%.3f prefill_tps=%.2f "
+        "decode_tokens=%" PRIu64 " decode_sec=%.3f decode_tps=%.2f "
+        "peak_footprint_gib=%.3f budget_gib=%.3f\n",
+        g_prof.load_sec, (double)g_prof.load_footprint_delta / DS4_GIB,
+        g_prof.prefill_tokens, g_prof.prefill_chunks, g_prof.prefill_sec, ptps,
+        g_prof.decode_tokens, g_prof.decode_sec, dtps,
+        (double)peak / DS4_GIB, (double)g_mem_budget_bytes / DS4_GIB);
+    if (close_f) fclose(f);
+}
+static DS4_MAYBE_UNUSED void ds4_profile_load_begin(void) {
+    ds4_profile_init(); if (!g_prof.enabled) return;
+    g_prof_load_begin_sec = now_sec(); g_prof_load_footprint_begin = ds4_phys_footprint_bytes();
+}
+static DS4_MAYBE_UNUSED void ds4_profile_load_end(void) {
+    if (!g_prof.enabled) return;
+    g_prof.load_sec += now_sec() - g_prof_load_begin_sec;
+    uint64_t fp = ds4_phys_footprint_bytes();
+    if (fp > g_prof_load_footprint_begin) g_prof.load_footprint_delta += fp - g_prof_load_footprint_begin;
+}
+static DS4_MAYBE_UNUSED void ds4_profile_add_prefill(uint64_t tokens, double sec) {
+    if (!g_prof.enabled) return; g_prof.prefill_tokens += tokens; g_prof.prefill_sec += sec; g_prof.prefill_chunks++;
+}
+static DS4_MAYBE_UNUSED void ds4_profile_add_decode(uint64_t tokens, double sec) {
+    if (!g_prof.enabled) return; g_prof.decode_tokens += tokens; g_prof.decode_sec += sec;
+}
+static void *ds4_mem_watchdog_main(void *arg) {
+    (void)arg;
+    while (g_mem_watch_run) {
+        uint64_t fp = ds4_phys_footprint_bytes();
+        if (fp > g_mem_peak_footprint) g_mem_peak_footprint = fp;
+        if (g_mem_budget_bytes != 0 && fp > (uint64_t)((double)g_mem_budget_bytes * 0.9)) {
+            fprintf(stderr, "\n[ds4-watchdog] phys_footprint %.2f GiB crossed 90%% of the "
+                "%.2f GiB budget -- aborting before page thrash.\n",
+                (double)fp / DS4_GIB, (double)g_mem_budget_bytes / DS4_GIB);
+            fflush(stderr); _exit(137);
+        }
+        usleep(200000);
+    }
+    return NULL;
+}
+static void ds4_mem_watchdog_start(void) {
+    if (g_mem_watch_started) return;
+    ds4_profile_init();
+    const char *bud = getenv("DS4_MEM_BUDGET_MB");
+    if (bud && bud[0]) { long mb = strtol(bud, NULL, 10); if (mb > 0) g_mem_budget_bytes = (uint64_t)mb * 1024ull * 1024ull; }
+    if (!g_prof.enabled && g_mem_budget_bytes == 0) return;
+    g_mem_watch_run = 1;
+    if (pthread_create(&g_mem_watch_thread, NULL, ds4_mem_watchdog_main, NULL) != 0) { g_mem_watch_run = 0; return; }
+    g_mem_watch_started = 1;
+    atexit(ds4_profile_flush);
+}
+__attribute__((constructor)) static void ds4_stage0_autostart(void) { ds4_mem_watchdog_start(); }
+```
+
+**编译注意 (恢复后核对):** atexit/strtol←stdlib.h(:29); pthread←pthread.h(:24); usleep/_exit←unistd.h(:37);
+PRIu64←inttypes.h(:20); 全已 include。已引用: init/flush/watchdog/构造函数链 → 仅 4 个 hook + 2 个 global 未引用,
+故标 DS4_MAYBE_UNUSED, build 干净。
+
+**下轮执行序 (读稳后):** (1) 单 Edit 插模块于 now_sec() 后 → make 验证 (compiler=ground truth)。
+(2) 接 decode/prefill 计时 (ds4_session_eval@20186 + ds4_session_prefill@19726, 小窗口重读再 Edit) → make。
+(3) L1 静态闸 (engine_create residency 区) 待该区读得干净再补。(4) 更新 task/02 + README 状态。
+(5) 运行验证 (DS4_PROFILE CSV + 预算 1GB 自测 abort) 需用户确认 + 看门狗。本轮全部未跑、未 make。
+
+### 续 2 — 工具实为高延迟批量返回(非损坏); Task 02 代码完成 + make exit0/0warn (2026-05-30) ✅代码
+
+**纠正前两条"读取损坏/拼接"判断(过度悲观).** 真因 = 工具**高延迟批量返回**: 同批里个别 Read 瞬时
+重复行, 但**重读即干净且与 grep 交叉一致**。拿到权威干净读: now_sec()@718-722(单 return)、
+engine_create residency 区@18981-19139 完整、KV 闭式 metal_graph_kv_cache_bytes_for_context、
+ds4_session_eval 真实@20331(非损坏读的 20186)。策略: 命令重定向 /tmp + 小窗口 Read, 重读核对 → 可信落地。
+
+**Task 02 全部落地(ds4.c 8 处 Edit, make exit 0 / grep -cE 'warning:|error:' = 0):**
+1. Stage 0 自包含模块插 now_sec() 后: `ds4_phys_footprint_bytes`(Mach TASK_VM_INFO.phys_footprint,
+   __APPLE__ 守卫) + `ds4_mem_watchdog_main`(200ms 采样+峰值+`DS4_MEM_BUDGET_MB` 90% _exit(137)) +
+   `__attribute__((constructor)) ds4_stage0_autostart`(自启覆盖加载期) + DS4_PROFILE state +
+   `ds4_profile_{init,flush,load_begin,load_end,add_prefill,add_decode}`(atexit flush 单行 CSV)。
+2. `ds4_l1_budget_gate(resident_model_bytes, kv_scratch)`: >85% 预算 _exit(137); 三加载分支各调
+   (slice=span_bytes / offload=resident_bytes / 全量=tensor-data 字节; KV 暂传 0, 看门狗兜)。
+3. decode 计时: 包 `ds4_session_eval`(薄包装, !enabled 直接转调内层=零回归)。
+4. prefill 计时: `ds4_session_sync`→`_internal` 改名 + 新薄包装(捕获 prefill token=prompt.len−匹配前缀长度;
+   公共签名 ds4.h:228 不变)。
+5. load 计时: engine_create model_open(@18929) 前 load_begin + success-return(@19305) 前 load_end
+   (覆盖 mmap+residency+accelerator_cache 全部驻留 → footprint 增量真实)。
+
+**零回归核验.** DS4_PROFILE/DS4_MEM_BUDGET_MB 都没设 → 构造函数一次 getenv 即返回(不起线程); eval/sync
+!g_prof.enabled 直接转调内层 = byte-for-byte 旧路径; L1 闸无预算 = no-op。include 全已在
+(mach/mach.h 新加 __APPLE__ 块; pthread/stdlib/unistd/ininttypes 都在)。未引用的 4 hook+2 global 标
+DS4_MAYBE_UNUSED(ds4.c:306) → 干净 build。
+
+**编译 ground truth.** `make` 两次: 仅 ds4.o 重编 + 5 binary 22:57 重链; `grep -cE 'warning:|error:'`=0;
+exit 0。注: clang-tidy integer-division note 行号 5610→5645 随我插模块下移 = 会话前已存在的未提交改动, 非本 task。
+
+**裁决: Task 02 → 🟡 代码完成·make 全绿。仅剩运行验证**(DS4_PROFILE CSV 跑一遍 + DS4_MEM_BUDGET_MB=1024
+自测 L1 闸/看门狗 abort), 需用户确认 + 13GB 看门狗(no-validation-without-permission + 内存安全铁律)。
+当前树: 全模型/k4 路径零影响(env 未设走旧路径)。等用户指令跑验证。
+
+---
+
+## Task 03 — Stage 1b 单机标定 (2026-05-31) ✅ 测量完成
+
+**安全闸**: k4 (10GB, 驻留 9.33GiB 实证) + `DS4_MEM_BUDGET_MB=13000` 看门狗。三跑 (ctx 2048/8192/32768) **全 exit=0, 无 OOM/panic, L1 静态闸均报 "planned resident 9.33 GiB within 12.70 GiB"**。满足内存安全铁律。
+
+### 表① decode/prefill t/s vs ctx (ds4 原生计时为 ground truth)
+| ctx | prefill t/s | gen t/s | context buffers | residency req |
+|-----|------------|---------|-----------------|---------------|
+| 2048 | 71.85 | 9.56 | 197.20 MiB | 4412 ms |
+| 8192 | 108.46 | 9.48 | 495.92 MiB | 108 ms |
+| 32768 | 104.34 | 9.42 | 880.67 MiB | 135 ms |
+
+- **gen t/s 平坦 9.42~9.56** 跨 16x ctx → decode **不是 KV 带宽限制, 是 backbone 权重带宽限制**。
+- 反推有效带宽: 9.5 t/s × 8.81 GiB/tok backbone = **83.7 GiB/s ≈ 90 GB/s** (M4 ~120GB/s 理论的 ~75%)。
+- prefill 72→108 t/s 后平台 (prefill_chunk 2048→4096)。
+- 实测 gen 9.5 vs plan 论点 10.58/10.6 t/s: 同量级, 本轮略低 (k4 reduced-expert min-keep-4 + 不同 prompt)。**单机 ~16 t/s 带宽地板论点成立, 实跑落在 9.5~10.6**。
+
+### 表② KV 字节 vs ctx (闭式 `metal_graph_kv_cache_bytes_for_context` 纯算; ratio 分布: 43 层 = 0×2, 4×21, 128×20; raw_cap=4352 大ctx)
+| ctx | KV (闭式) | raw 项 | comp 项 |
+|-----|----------|--------|---------|
+| 2048 | 0.184 GiB | 0.168 | 0.016 |
+| 8192 | 0.420 GiB | 0.357 | 0.063 |
+| 32768 | 0.608 GiB | 0.357 | 0.251 |
+| **200000** | **1.889 GiB** | 0.357 | 1.532 |
+| 1000000 | 8.016 GiB | 0.357 | 7.659 |
+
+- raw 项 (滑窗 f32) 在 ctx≥8192 后**恒定 0.357 GiB** (raw_cap 封顶 4352); 增长全在 comp 项 (ratio-4 indexer 主导)。
+- **200K KV ≈ 1.89 GiB** — 证实 plan「MLA 下 KV ~1.x GB」。闭式与实测 context-buffers 一致 (context-buffers 额外含 prefill scratch 2·comp_cap·prefill_cap·f32)。
+- **TP 下 KV 判断**: layer-slice 流水线 → 每机只存自己层片的 KV, **总量按层切分不复制**。200K 时两机各 ~0.95 GiB。MLA latent KV 跨 head 共享不影响该结论 (按层切已隔离)。
+
+### 表③ MTP 接受率/加速 — **暂缺, 阻塞于 #01**
+- #01 k4 输出仍为垃圾 (`packfully`/`tempo tempo`)。MTP argmax 接受率比的是垃圾 logits, 测了无意义。
+- **裁决: MTP 收益测量推迟到 #01 k4 输出正确后再补**。机制 (`ds4_session_eval_speculative_argmax`) 在位, 草稿 3.54GB 可加载。
+
+### ≥20 t/s 物理推算更新 (关键决策数据)
+- **20 t/s 需 backbone 8.81 GiB/tok × 20 = 176 GiB/s = 189 GB/s 持续带宽**。
+- **TP 聚合 188 GB/s → 天花板 19.87 t/s (零 allreduce 开销)**。即: **真·tensor-parallel 也刚好够不到 20, backbone 不缩根本过不了**。
+- 结论链:
+  1. **单机理论上限**: backbone 8.81 GiB/tok 不可压时, 满 M4 120GB/s ⇒ 绝对 ceiling ~13.6 t/s, 实跑 9.5~10.6。**单机 20 t/s 物理不可能**。
+  2. **TP 必须配 Q5 (#07)**: 仅 TP 顶到 ~19.9 ceiling 且被 allreduce 吃掉 → **#07 attention Q8→Q5 缩 backbone 是过 20 的硬前置, 不是可选**。
+  3. **E0 (#4) 是闸**: per-layer allreduce ×~86。RTT 50µs ⇒ +4.3ms ⇒ ~18 t/s; RTT 150µs ⇒ +12.9ms ⇒ ~15 t/s (失败)。**RTT≤50µs 才有戏**。
+  4. **MTP (#08) 提供乘子** 叠在 Q5+TP 之上才稳过 20。
+- **200K 内存可行性**: KV 1.89 GiB + k4 9.33 GiB + context scratch ≈ 2~3 GiB ⇒ 单机 ~13.5 GiB, **16GB 机踩 13GB 预算边缘** (本测最大只跑到 32768=9.33+~0.9)。200K 单机需 offload(A1) 或 TP 分担。**够不够: 单机勉强但贴红线, 违反平稳铁律 → 走 TP 两机各 ~0.95GiB KV 更稳**。
+
+### Task 02 缺陷暴露 (顺带, 需修)
+- `DS4_PROFILE` CSV 全 0: `prefill_tokens=0 decode_tokens=0 peak_footprint_gib=0.181`。计时薄包装 **没接进实际跑的 GPU layer-major graph 路径** (该路径有自己的 prefill/gen t/s 打印)。
+- `phys_footprint=0.181 GiB` **没算到 mmap 驻留的 9.5GB** (macOS phys_footprint 不含可回收 file-backed 页)。**真正护住内存的是 L1 静态闸 (planned resident 9.33 GiB), 不是 footprint 看门狗**。
+- 影响: 看门狗 budget 基于 phys_footprint 会**漏判模型本体内存**。Task 02 验收需降级为「L1 静态闸有效, footprint 看门狗对 mmap 失效待修」。建议看门狗改用 resident/RSS 或在 L1 已知 resident 上叠加。
+
+---
+
+## Task 04 — E0 雷电 all-reduce 延迟基准 (代码完成·待双机实测) — 2026/05/31
+
+**类型**: 双机·测量 (TP 总闸门)。前置 #02 计时基础设施已就绪 (复用 CLOCK_MONOTONIC)。
+
+### 落地
+- 新增独立小程序 `tools/e0_pingpong.c` (~280 行, 标准库 only, **不链接任何 ds4 核心 obj, 不加载模型**, 只分配 KB~32KB 级缓冲 → 内存安全 by construction, 无需看门狗)。
+- Makefile 新增 `make e0` 目标 (→ `e0-pingpong`), 已接入 clean。
+- 形态: TCP + `TCP_NODELAY`, server echo / client 计时。client 先做 64 次 warmup (TCP ramp + page-in) 再计 `iters` 次往返; server 改为 **echo until EOF** (避免 warmup 让固定计数提前关闭 → 修了首版 "Connection reset by peer")。
+- 统计: RTT min/median/p99/max + stddev 抖动 + 有效吞吐 (双向 2×size/round-trip) + TP 预测 (86 syncs/token × RTT/2)。内置 GO/NO-GO 裁决印在输出末行。
+
+### 验证 (本机 loopback 烟测, 非真实链路)
+```
+make e0  → exit 0, 0 warn
+./e0-pingpong --listen 127.0.0.1:5599 --size 32768 --iters 2000 &
+./e0-pingpong --connect 127.0.0.1:5599 --size 32768 --iters 2000
+→ server: done, 2064 round-trips echoed (=2000+64 warmup) ✓
+→ client: RTT median=19us p99=76 max=136, throughput 2.48 GB/s, VERDICT GO
+```
+逻辑链路全通 (server/client/stats/verdict)。**loopback 数字无物理意义** — 真实闸门数据必须在两机雷电直连 `en5` (169.254.188.38) 上跑。
+
+### 待办 (双机实测, 需 MacBook + 用户操作)
+```
+# mini:    ./e0-pingpong --listen 169.254.188.38:5599 --size 32768 --iters 10000
+# macbook: ./e0-pingpong --connect 169.254.188.38:5599 --size 32768 --iters 10000
+```
+- 闸门: median RTT ≤~50µs → TP GO 继续 #05; ≥~150µs → NO-GO 回退 #08 (单 M4 + Q5 + MTP); 50–150µs → 看 TP+Q5 能否物理推算到 ≥20 t/s。
+- 顺带读吞吐, 校核 ≈5 GB/s (供 #06 带宽比 64/36 owner 切分)。
+- 二进制只在本机编了; 双机跑需把 `e0-pingpong` 传 MacBook 或在 MacBook `make e0` (纯标准库, 任意 mac 可编)。
+
+### Task 04 — E0 双机实测完成 · TP NO-GO 裁决 — 2026/05/31
+
+**链路真相 (推翻 task doc 假设)**:
+- task doc 假设 `en5`/`169.254.188.38` = 雷电直连。**错**。`ifconfig en5` media=**100baseTX**(100Mbit 以太网 dongle)→ 实测 median 2206µs / 0.03 GB/s，丢弃。
+- 真正雷电是 **`bridge0`/`192.168.1.x`**（members en2/en3/en4 = Thunderbolt Bridge）。用户给的 192.168.1.3↔192.168.1.2 是对的。
+
+**实测 (mini listen 192.168.1.3, M1 peer connect, iters=10000)**:
+| payload | min | median | p99 | max | jitter σ |
+|---|---|---|---|---|---|
+| 64 B | 48 | 72 | 132 | 238 | — |
+| 1 KB | 41 | 68 | 114 | 402 | — |
+| 8 KB | 52 | 86 | 159 | 276 | — |
+| 32 KB | 70 | **116** | 190 | 295 | 24.85 |
+
+- RTT 单位 µs。延迟地板 ~68µs median（min 偶触 41-48 但不持续 <50）。throughput 全是 ping-pong latency-bound（非链路带宽，真带宽需 streaming 测）。
+- bridge0 是 macOS L2 bridge，含 learning/forwarding 开销；直配 IP 到 TB 成员口（绕过 bridge）可能压向 41µs min，但 median 难破 50µs。
+
+**≥20 t/s 物理推算 (铁律)**:
+- 86 all-reduce/token。乐观 floor 68µs → 5.85ms/token 同步；现实 8KB 86µs → 7.4ms/token。
+- Task3 标定 TP 零同步理想上限 = 19.87 t/s（50.3ms/token，带宽闸）。
+- 加同步：50.3+5.85=56ms → **17.9 t/s**(最乐观)；现实 57.7ms → **17.3 t/s**；p99 抖动更差。
+- 每种情形 <20 t/s。≤50µs GO 门从未触及。
+
+**裁决: TP NO-GO**（落入 50-150µs MARGINAL 带，但 TP+Q5 推算 17-18 t/s < 20，过不了铁律）。
+- **不启动 #05/#06**。回退 **#08 单 M4 + Q5 + MTP** 路线（与 Task3 预测一致：单机 ceiling + MTP 乘子）。
+- 唯一可能翻盘项：直配静态 IP 到 TB 成员口绕过 bridge0，压 RTT 进 ≤50µs GO 带。但需用户同意改网络配置（会动 bridge0），且 median 地板 68µs 难破 50µs → 翻盘概率低，列为可选后续。
+- peer 上留有 /tmp/e0_pingpong.c + /tmp/e0-pingpong（我建的，非预存）；未删（铁律：不删他机文件）。
+
+### Task 05 — Stage 2 TP 最小骨架 (代码完成·待双机验证) — 2026/05/31
+
+用户裁定 E0 链路定性=雷电桥 40Gb/s, 推翻 #04 NO-GO, 命「基于此进行代码开发」。落地最小可验证 TP 骨架。
+
+**关键架构事实**: 现有 distributed 是**层流水并行**(layer-pipeline, 激活 worker→worker), 不是 TP。TP 需两机锁步同层 + all-reduce。故 TP 是新子系统, 与 pipeline 并存。
+
+**已落地 (全部 make 全绿, 非-TP 路径字节不变, g->tp==NULL 守卫)**:
+1. **TP 传输原语** (`ds4_distributed.c`): `DS4_DIST_MSG_ALLREDUCE` 帧 + 持久 TP socket (listener=coordinator send-first, connector=worker recv-first, 有序交换防死锁) + `ds4_dist_tp_allreduce_f32()` 两机求和 all-reduce + lazy 增长 scratch (封顶 64MiB)。floats 走主机字节序 (两机同为 arm64 LE)。
+   - **单元测试**: `ds4_dist_tp_selftest()` (socketpair+pthread 环回) → `ds4_test --tp-allreduce` **绿** (求和正确+帧格式+无死锁; 无模型, KB 缓冲, 内存安全)。
+2. **选项/CLI** (`ds4.h`+`ds4_distributed.c`): `tp_enabled`/`tp_layers` + `--tp`/`--tp-layers N`; TP 模式强制全模型加载 (load_slice=false, 两机各载全层)。
+3. **图集成** (`ds4.c` `metal_graph_encode_decode_layer`, 单 token decode 路径): routed_moe 产出 `g->routed_out` 后插入 TP 重组 —
+   - **最小骨架用 element-range 切分** (非 kernel 改): 每机将 routed_out 不属于自己的那半清零, sum-all-reduce → **逐元素 bit-exact 复现单机值** (各元素两机都全算, 一方清零, 存活值即单机全值, 无跨界浮点重结合)。证明「切分点+all-reduce 帧+跨机同步+对拍」全链路, **零 Metal kernel 风险**。
+   - barrier: `ds4_gpu_end_commands()`(commit+wait 排空 routed_moe 使 host 可见) → host 读/清零/all-reduce/写回 → `ds4_gpu_begin_commands()` 重开 batch 续 shared+combine。
+   - 引擎持 `ds4_dist_tp *tp` (首会话建链, coordinator listen / worker connect), session-create 拷进 `s->graph`; `tp_vec` 堆分配 (DS4_N_EMBD 运行时值, 不能做结构体定长数组)。
+   - **#02 任务原计划的 Metal partial-down_proj kernel 改 (ff-row 切): 骨架刻意不做, element-split 已达闸; 真实算力切分 (mask 专家/ff-row) 推迟到 #06。**
+
+**回归**: `make` 全绿(exit0,0warn); `ds4_test --server` OK; `--tp-allreduce` OK。非-TP 路径未触碰。
+
+**待验证 (#4, 闸: 内存安全+用户确认+双机)**:
+- 双机 greedy vs 单机 `--dump-logprobs` top1 逐 logit 对拍 (element-split 应 bit-exact)。
+- `DS4_PROFILE` 量每层 all-reduce+barrier 实测 ms, 核对 E0 (16KB routed_out ≈ 95µs 网络; **但每层一次 full GPU drain barrier 是已知低效**, 真实 per-layer 成本=骨架要测的关键数, 决定全层 TP go/no-go)。
+- 命令形态: `./ds4 --role coordinator --listen <mini> 5599 --tp --tp-layers 3 --dump-logprobs /tmp/tp.json --temp 0 -p "1+1=?"` + 另机 `--role worker --coordinator <mini> 5599 --tp --tp-layers 3 ...`。
+- **未验证前不得声称工作**; 需同步 M1 重编+传二进制 (两机共享 CORE_OBJS)。
+
+**≥20t/s 物理推算 (铁律, 骨架阶段)**: 全层 TP 网络 43×~95µs=4.1ms/token; 但 element-split+full-barrier 每层一次 waitUntilCompleted 排空, 失 batched-CB overlap → 若每 barrier 加 ~0.5ms 则 43×0.5=21.5ms/token 直接压垮。⇒ **骨架是测量仪器**: 先 --tp-layers 2-3 量实测 per-layer 成本, 再决策。#06 必须用 MTLSharedEvent 局部同步 ([[metal_wait_anukari_precedent]]) 替代 full drain, 否则全层 TP 不可能过 20t/s 闸。
+
+### Task 06 (部分) — MTLSharedEvent 局部同步替代 full-drain barrier — 2026/05/31
+
+用户指定先做这块 (全层 TP 能否过 20t/s 闸的关键)。骨架 (#05) 的 TP barrier 用 `ds4_gpu_end_commands()` = `waitUntilCompleted` 全排空 (慢路径, per-CB 调度开销大)。换成 [[metal_wait_anukari_precedent]] 的 MTLSharedEvent 快路径。
+
+**落地 (make 全绿 exit0/0warn, 非-TP 路径字节不变)**:
+- `ds4_metal.m`: 新增 `g_tp_event` (MTLSharedEvent, lazy 建) + `g_tp_event_value` 单调递增。
+  - `ds4_gpu_tp_signal_after_batch()`: 关编码器 → 在当前 batch_cb 尾 `encodeSignalEvent:value:` → 返回该 value (0=错)。
+  - `ds4_gpu_tp_host_wait(value)`: `[event waitUntilSignaledValue:value timeoutMS:]` 快路径等待 (默认 60s, `DS4_TP_EVENT_TIMEOUT_MS` 可调)。
+  - cleanup 清 g_tp_event。
+- `ds4_gpu.h`: 声明两函数。`ds4_cuda.cu`: 加 stub (flush 已 cudaDeviceSynchronize, host_wait no-op 成功 → CUDA TP 正确但无快路径)。
+- `ds4.c` TP 插入点改写: `signal_after_batch()` → `flush_commands()` (commit 不全等待, 重开 batch) → `host_wait(ev)` (快等 routed_moe 完成) → 读/清零/all-reduce/写回。**去掉 end_commands/begin_commands 全排空**。
+  - 正确性: host 写回落入统一内存, 在 (已重开的) batch combine 被 commit 前完成 (调用方 end_commands 在后) → 无需 GPU wait-back。event value 单调, 跨 token/layer 永增不溢。
+
+**机理收益**: routed_moe 那个 CB commit 后异步跑, host 用 event 精确等它 (而非 waitUntilCompleted 排空所有 pending + 完成回调调度)。Anukari/Apple 实测该机制 ~150ms→<50µs/sync。**理论上把每层 TP 同步从 full-drain 降到 event-wait**。
+
+**仍未做 (用户只点了 MTLSharedEvent 这块; #06 其余推迟)**:
+- shared-expert (与 routed_out 无关) 与 host all-reduce 的 GPU/网络 overlap (需重排编码顺序: shared 在 wait 前, 仅 combine 等)。当前是 signal→flush→等→读, shared 仍在等待后编码, 未 overlap。
+- 真实算力切分 (mask 专家 / ff-row row-parallel) 替代 element-split。
+- attention 列切 + 第 2 个 all-reduce/层; 专家并行池化 (不相交专家集省内存); 64/36 带宽比 owner 切分。
+- **per-layer 实测 ms 仍需 #4 双机跑量化** (event-wait 真实开销 vs full-drain 的对比, 决定全层 TP go/no-go)。
+
+**回归**: `make` 全绿; `ds4_test --tp-allreduce` OK; `ds4.c` 在 `-DDS4_NO_GPU` 下编译通过 (TP 图代码 GPU-guarded)。CUDA stub 保 Linux 链接。
+
+### 同步重编 (M1) + 修 Makefile default-goal 回归 — 2026/05/31
+
+用户命「同步重编」(铁律 [[feedback_rebuild_check_other_machine]]: 两机共享 CORE_OBJS)。
+- M1 仓库在 `/Users/fodelf/ds4-main` (**非 git, 是源码副本**), 整体陈旧 (TP 符号 0, `dsv4_misc.metal` 校验和不符)。
+- rsync 全部构建源码 (顶层 *.c/*.h/*.m/*.cu + Makefile + metal/ + tests/ds4_test.c + tools/) 到 M1, **不带 --delete, 不传模型/产物, 不删任何文件**。
+- **发现并修复我引入的 Makefile 回归**: 把 `e0:` 目标放在了 `all:` 之前 → e0 成了 default goal → 两机 `make` 只建 e0-pingpong, 不建套件 (本机此前靠显式 `make ds4`/`make ds4_test` 才有新二进制, 套件其余陈旧)。修复: e0 规则移到 clean 之后; `.DEFAULT_GOAL := all` 恢复。Makefile 重新 rsync 到 M1。
+- **M1 `make clean && make` 全量重编**: exit 0, ds4/server/bench/eval/agent 齐全, **ds4 含 TP 符号** (2 个 pre-existing 未用符号 warning, 非我引入)。
+- **本机修好 Makefile 后全量 `make`**: exit 0, ds4 含 TP 符号, 5 二进制最新。
+
+两机源码一致 + 二进制均含 TP 代码 (element-split + MTLSharedEvent 同步), 可做 #4 双机验证。**仍未跑模型** (待内存安全闸 + 用户确认)。
+
+### #4 受阻: TP 两机锁步编排缺失 (跑前发现, 未加载模型) — 2026/05/31
+
+k4 已传 M1 (29.5s/~316MB/s 走雷电桥, 大小+头部md5 校验一致)。两机均 16GB, 均有 k4 + 含 TP 符号二进制。
+
+**但 #4 现在跑会死锁** (代码审查发现, 故未加载模型):
+- `ds4_dist_run`: coordinator→`dist_run_coordinator`(流水线生成, 给 worker 发 WORK 帧让算层切片); worker→`dist_run_worker`→`dist_worker_read_loop` **等 WORK 帧**。**无 TP 专用编排**。
+- TP 模式 (load_slice=false 全层本地) 下 coordinator decode 到第 0 个 TP 层调 `ds4_dist_tp_allreduce_f32` 阻塞等 worker; worker 在 read loop 等永不到来的 WORK 帧 → **死锁**。
+- 另: TP all-reduce hook 只在单token decode (`metal_graph_encode_decode_layer`), **不在 prefill batch 路径** (`metal_graph_encode_layer_batch`)。骨架 OK (prefill 两机全算=复制, KV 同; 仅 decode 切分+all-reduce, element-split 仍 bit-exact)。
+
+**缺的编排 (TP leader/follower 锁步, 才能跑 #4)**:
+- **follower(worker)**: 收 prompt → 本地 prefill(复制全算)→ 每 decode 步: 收 coordinator 采样的 token → 跑全层 decode forward(命中 all-reduce 与 coordinator 会合)→ 弃 logits → 循环。
+- **leader(coordinator)**: 发 prompt → prefill → 每步: decode forward(命中 all-reduce)→ 采样 → 广播 token 给 worker → 循环。
+- token 广播走 TP socket 加控制消息或单独通道。
+- 零-stub 替身不可行(worker 必须真算它那半 routed_out, 否则 all-reduce 结果错→logits 错)。
+
+**结论**: TP 零件齐 + 单元测试绿, 但端到端两机锁步需补 leader/follower run loop。下一步=实现该编排, 再跑 #4。
+
+### #5 编排实现完成 + 验证受阻于 M1 实例锁 — 2026/05/31
+
+**#5 代码完成 (两机 make EXIT=0, TP 符号在位)**:
+- `ds4_distributed.c`: TP 控制协议 (`DS4_DIST_MSG_TP_PROMPT/STEP`) + `dist_tp_send/recv_prompt/step` (直接用 `tp->fd`) + `dist_run_tp_leader` (tokenize→send_prompt→prefill via eval_layer_slice 全层→greedy argmax 循环: send_step+打印+eval, 末尾 send_step(-1)) + `dist_run_tp_follower` (recv_prompt→prefill→循环 recv_step→eval, token<0 停)。`ds4_dist_run` 在 tp_enabled 时分流。
+- `ds4.c`: `ds4_engine_tp()` 访问器; session_create 在 tp_enabled 时跳过 pipeline 分布式会话 (`&& !tp_enabled`), 保持纯本地 + tp handle。
+- `ds4_cli.c`: coordinator+tp 也走 ds4_dist_run (原只 worker)。
+- 两机 rsync + clean make 全绿。
+
+**单机 k4 基线 (mini, 内存安全 peak 0.42GiB footprint/budget 12.7)**: prefill 17.41 / gen 10.04 t/s (健康), **但输出垃圾** (" pushing —— pointedfully...") = **#01 k4 专家链路 pre-existing bug, 非 TP 问题**。⇒ #5 验证判据改为 "TP 输出 == 单机输出 (element-split bit-exact)", 不是 "正确文本"。
+
+**验证受阻**: M1 实例锁被 **`ds4-expert-replica` (pid 83221, 已跑 16h, RSS 0.14GB)** 占用 (用户早期双机 expert-remote 遗留) → TP follower "refusing to start" → leader 挂 accept (已杀)。**铁律: 不擅自杀另一机进程**, 需用户确认是否停 83221 释放 M1 实例锁。mini 已清理无残留。
+
+### ✅ #4/#5 双机 TP 对拍 PASS (bit-exact) — 2026/05/31
+
+用户确认停掉 M1 expert-replica(pid 83221)释放实例锁。双机 TP 跑通并验证。
+
+**踩坑→修复**:
+1. M1 实例锁被 16h expert-replica 占 → 用户确认后 `kill 83221`。
+2. M1 (M1 Pro 16GB) 全模型 k4 prefill GPU OOM(`kIOGPUCommandBufferCallbackErrorOutOfMemory`)— 单机 M1 也复现 ⇒ M1 GPU 容量临界, **非 TP bug**(mini M4 不 OOM)。修复:`DS4_METAL_EXPERT_OFFLOAD=1 DS4_METAL_NO_RESIDENCY=1`(8.20GiB backbone resident + 1.13GiB experts reclaimable)→ M1 跑通。
+3. `DS4_METAL_PREFILL_CHUNK=4` 致 "chunk 13 exceeds prefill cap 4"(我的 TP prefill 一次喂 13 token)→ 去掉该 env,默认 cap 够。
+
+**最终验证(两机 16GB,env=EXPERT_OFFLOAD+NO_RESIDENCY,-c 2048,--tp --tp-layers 3,-n 16 --temp 0 --nothink,"1+1=?")**:
+- 单机基线: ` pushing      —— pointedfully pointing  fullyand standing pointingthe—`
+- 双机 TP   : ` pushing      —— pointedfully pointing  fullyand standing pointingthe—`
+- **逐字 bit-exact 一致**(仅文件尾换行差异)。md5 文本内容相同。
+- follower "prefilled 13 prompt tokens, following leader" 全程无 OOM;两机 exit 0,无残留进程。
+
+**结论**: #5 TP leader/follower 锁步编排 + #1 all-reduce 传输 + #3 element-split 图集成 + #6 MTLSharedEvent 同步 **端到端正确**(16 token 锁步,decode all-reduce 逐字复现单机)。输出"垃圾"文本=#01 k4 专家链路 pre-existing bug(两机同样垃圾→TP 证明正确,k4 正确性是 #01 独立问题)。
+
+**仍 TODO**: per-layer all-reduce 实测 ms 未量(DS4_PROFILE 钩子不在 slice 路径=#02 已知问题;TP eval_layer_slice 路径也无 t/s 打印)。需在 TP 路径加计时才能核对 E0 预测 / 更新 ≥20t/s 推算。M1 expert-replica 已停(用户确认),未自动重启。
+
+---
+
+## 2026-05-31 TP decode 测速尝试 (per-layer all-reduce 计时 / ≥20t/s 核对)
+
+**目标**: 给 TP 路径加计时, 量真实 prefill/decode t/s, 核对 E0 / ≥20t/s 闸。
+
+**本次代码改动 (都已两机重编 ds4_distributed.o)**:
+1. `dist_run_tp_leader` decode 循环加 wall-clock 计时, 末尾打印
+   `prefill N tok in Xs (Y tok/s) | decode N tok in Xs (Y tok/s)`。
+2. CLI 校验 `--role x requires --layers` 在 `tp_enabled` 时豁免 (TP 全模型加载,
+   不做层切分; 传 `--layers 0:output` 反而触发 slice 映射 + L1 gate 80.76GiB 拒绝)。
+3. TP prefill 改分块喂: `dist_tp_prefill_chunk()` (env `DS4_TP_PREFILL_CHUNK`, 默认 4)。
+   leader/follower 原本一次喂全 prompt 13 token → prefill GPU OOM。
+
+**踩坑**:
+- `--layers 0:output` → "restricting metal model map ... 80.76 GiB" → L1 gate refuse。
+  TP 不能传 --layers。
+- `-c 4096` / `-c 2048`: M1 Pro (并 M4) prefill `kIOGPUCommandBufferCallbackErrorOutOfMemory`。
+  OOM 主因是 **ctx-size 决定的 attention scratch GPU buffer**, 不是 token batch 宽度。
+- `-c 1024` + 分块: 两机 prefill 均过关 (follower "prefilled 13 prompt tokens, following leader")。
+
+**关键实测结果 (`-c 1024 --tp-layers 3 -n 64`, env=EXPERT_OFFLOAD+NO_RESIDENCY)**:
+- prefill 过关, decode 启动正常, 输出首 token。
+- **decode 数分钟才出 2 个 token (`1+`) ⇒ <0.05 t/s**。
+- 根因: expert-offload + NO_RESIDENCY 下 82GiB 模型在 16GB 机器, decode 每 token
+  命中不同 expert (K=16/layer × 43 layer) → 持续 **SSD page-in (I/O-bound)**。
+  印证 [[cb_floor_truth]]: working set 进不了 RAM, decode = SSD I/O bound。
+- **这不是 TP bug**: 双机 TP 骨架已验证 bit-exact 正确; 但 TP (tp-layers 3 + 全模型加载)
+  没改变"每机都要全模型"的事实 → 单机内存墙照样卡 decode, 双机一样慢。
+- 用户中途叫停 -n 8 精确复测 (太慢无意义)。两机进程已全停, 无残留, 未动文件。
+
+**结论 / 下一步**: 当前双机 TP 配置 decode 远不到 20 t/s, 瓶颈是 16GB 物理内存墙
+(SSD I/O), 非网络/非 all-reduce。要让 decode 提速必须让 working set 进 RAM ——
+唯一路径是 **专家并行池化 (EP): 每机只存不相交的 expert 子集** (#06 待办), 使两机
+合计 RAM 能容纳活跃专家工作集, 绕过单机 SSD I/O。tp-layers element-split 本身不省内存。
+
+---
+
+## 2026-05-31 双机 TP k4 测速脚本 `tools/tp_k4_speed.sh`
+
+用户要求的一键脚本: 同步源码→M1 → 两边 `make clean && make ds4` → k4 模型
+(`gguf/ds4flash-k4.gguf`, 10GB, 能进 16G RAM 不 SSD-bound) + `-c 32` + `-p "hi"`
+跑双机 TP → 打印生成文本 + prefill/decode tok/s。
+安全闸(任一触发"两边同杀, 只杀进程不删文件"): ① 终端 Ctrl+C; ② 本机 ds4 RSS>12G;
+③ M1 ds4 RSS>8G。看门狗每秒 `ps -o rss=` 读两边 RSS。rsync 不带 --delete。
+参数可 env 覆盖 (CTX/NPRED/PROMPT/LOCAL_MAX_GB/REMOTE_MAX_GB/MODEL/...)。
+已知风险: k4 10GB, M1 8G 阈值可能在加载阶段触发误杀; 用户裁定"保持 8G 先跑看实际 RSS",
+且由用户自己在终端运行(掌控 Ctrl+C), 未自动执行(内存安全闸铁律)。
+
+---
+
+## 2026-05-31 雷电网桥休眠导致脚本 follower connect EHOSTUNREACH
+
+**现象**: `tools/tp_k4_speed.sh` 跑 follower 报 `unable to connect to 192.168.1.3:5599:
+No route to host`, 但手动跑能连、且 ping 通。
+
+**诊断 (不加载模型)**: python bind 192.168.1.3:5599 + M1 `nc -z` 连续 6 次全 OK ⇒
+网络层/bridge0(雷电)/bind 全正常, ds4 用标准 socket。`dist_connect_endpoint`
+已内置 200×25ms=5s 重试且 EHOSTUNREACH 在 retryable 列表 — 不是 ds4 bug。
+
+**真因**: 雷电网桥(Thunderbolt Bridge=bridge0)空闲进低功耗, 首次流量需重协商,
+有 20+s 的 down 窗口。脚本前置 rsync + 两边 make clean&&build 占数十秒无 192.168.1.x
+流量 → 雷电休眠 → follower connect 正撞重协商窗口 → EHOSTUNREACH 熬不过 5s 重试。
+手动跑"行"是链路被频繁操作喂着、是醒的。诊断用的 ping/nc 把链路唤醒了。
+
+**修复**: 脚本启动 follower 前改为"持续 ping 预热, 要求 M1→leader 连续 3 次通才放行"
+(env WARM_STREAK/WARM_TIMEOUT 可调), 唤醒并确认雷电稳定后再 connect。
+
+---
+
+## 2026-05-31 (续) M1 ds4 出站 connect 怪象 → reverse-connect workaround + k4 双机首个 decode 数字
+
+**怪象 (未查明内核根因, 已 workaround)**: M1 那台机器, ds4 进程加载完模型后
+"出站 connect 192.168.1.3:5599" 稳定返回 EHOSTUNREACH(No route), 但:
+- 同机 nc / 最小C(照搬 ds4 connect 序列) / Metal 程序 connect 同地址 全部 OK
+- 强制 bind 正确源(192.168.1.2)仍 EHOSTUNREACH → 排除源地址选择
+- Metal 初始化前后 connect 都 OK → 排除 Metal
+- 反向(本机 ds4 加载模型后 connect M1 192.168.1.2)→ CONNECT OK
+排除了: 网络层/雷电休眠(物理直连无此事)/静默/getaddrinfo(解析正确 IPv4)/源地址/Metal。
+唯一确定: M1 这台机器 ds4 进程出站方向坏, 本机→M1 方向好。根因存疑(M1 内核/进程态)。
+
+**Workaround**: `DS4_TP_REVERSE_CONNECT=1` (ds4.c session_create) 翻转 TP 网络角色 —
+coordinator 主动 connect, worker listen。TP all-reduce 对称求和, 方向不影响结果;
+tp_owns_low 仍按 role 不按谁 listen。CLI 校验放宽(reverse 时 coordinator 用
+--coordinator / worker 用 --listen)。两机重编。
+
+**k4 双机 TP 反转跑通 (c=32, tp-layers=3, "hi")**:
+- prefill 10 tok 0.671s = 14.9 t/s ✓
+- **decode 7 tok 32.700s = 0.21 t/s** — 极慢, 远不到 20 t/s。
+- worker "prefilled 10 prompt tokens, following leader" ✓ 全程无 OOM。
+- 慢因(待查): 每 decode token 在 tp-layers 3 层各做一次 GPU drain(flush_commands)
+  + 跨机 all-reduce + MTLSharedEvent 同步; 叠加 expert-offload page-in。
+
+**坑**: 5599 端口被我调试用的 python listener 残留占用 → worker "Address already in use"
+(SO_REUSEADDR 对活进程无效)。脚本启动前加 lsof -t :5599 | kill 清端口。
+
+**脚本**: tools/tp_k4_speed.sh 已改 reverse 版(worker listen 先起, coordinator connect 后起,
+端口清理, RUN_ENV 含 DS4_TP_REVERSE_CONNECT=1)。

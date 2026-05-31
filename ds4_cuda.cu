@@ -1422,6 +1422,11 @@ extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
 extern "C" int ds4_gpu_end_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "end commands"); }
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
+/* TP rendezvous: CUDA has no MTLSharedEvent fast path, but ds4_gpu_flush_commands
+ * already does a full device sync, so by the time the host waits the results are
+ * visible. signal returns a nonzero token; host_wait is a no-op success. */
+extern "C" uint64_t ds4_gpu_tp_signal_after_batch(void) { return 1; }
+extern "C" int ds4_gpu_tp_host_wait(uint64_t value) { (void)value; return 1; }
 
 extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return 0;
@@ -1546,6 +1551,23 @@ extern "C" int ds4_gpu_set_model_map_spans(
         }
     }
     return 1;
+}
+
+extern "C" int ds4_gpu_set_model_map_spans_split(
+        const void *model_map,
+        uint64_t model_size,
+        const uint64_t *offsets,
+        const uint64_t *sizes,
+        const bool *resident_flags,
+        uint32_t count,
+        uint64_t max_tensor_bytes) {
+    /* CUDA does not use Metal's residency-set hint: cold routed-expert reads
+     * already fall back to the UVA-mapped pointer (see accelerator_cache_model
+     * _tensor_spans in ds4.c, which skips "_exps." at the HBM cache stage). The
+     * resident flags are therefore advisory only here; map every span as usual. */
+    (void)resident_flags;
+    return ds4_gpu_set_model_map_spans(model_map, model_size, offsets, sizes,
+                                       count, max_tensor_bytes);
 }
 
 extern "C" int ds4_gpu_set_model_fd(int fd) {

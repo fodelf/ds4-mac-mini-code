@@ -50,6 +50,7 @@
 #define DS4_DIST_MSG_SNAPSHOT_CHUNK 7u
 #define DS4_DIST_MSG_SNAPSHOT_DONE 8u
 #define DS4_DIST_MSG_SNAPSHOT_LOAD_BEGIN 9u
+#define DS4_DIST_MSG_ALLREDUCE 10u /* tensor-parallel partial-sum exchange */
 #define DS4_DIST_MAX_MODEL_NAME 127u
 #define DS4_DIST_WORK_F_INPUT_HC 0x00000001u
 #define DS4_DIST_WORK_F_OUTPUT_LOGITS 0x00000002u
@@ -1238,15 +1239,56 @@ static int dist_connect_endpoint_once(const char *host, int port, int *last_errn
 
     int fd = -1;
     int saved_errno = 0;
+    /* Diagnostic: DS4_TP_CONNECT_DEBUG=1 logs the resolved target, the chosen
+     * source address, and connect errno. Capped so a 200x retry storm cannot
+     * flood. */
+    static int dbg = -1, dbg_n = 0;
+    if (dbg < 0) { const char *e = getenv("DS4_TP_CONNECT_DEBUG"); dbg = (e && *e) ? 1 : 0; }
     for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        if (dbg && dbg_n < 12) {
+            char ip[64] = "?";
+            void *ad = ai->ai_family == AF_INET
+                ? (void *)&((struct sockaddr_in *)ai->ai_addr)->sin_addr
+                : (void *)&((struct sockaddr_in6 *)ai->ai_addr)->sin6_addr;
+            inet_ntop(ai->ai_family, ad, ip, sizeof(ip));
+            fprintf(stderr, "ds4: [tp-connect-dbg] try family=%s dst=%s:%s\n",
+                    ai->ai_family == AF_INET ? "IPv4" : "IPv6", ip, portbuf);
+            dbg_n++;
+        }
         fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (fd < 0) {
             saved_errno = errno;
+            if (dbg && dbg_n < 12) { fprintf(stderr, "ds4: [tp-connect-dbg] socket errno=%s\n", strerror(saved_errno)); dbg_n++; }
             continue;
         }
         dist_set_socket_low_latency(fd);
-        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
+        /* Optional: force the connect source address (出接口) to a specific local
+         * IP. Diagnoses/works around the kernel picking an unreachable source. */
+        const char *src_ip = getenv("DS4_TP_SRC_IP");
+        if (src_ip && *src_ip && ai->ai_family == AF_INET) {
+            struct sockaddr_in sa; memset(&sa, 0, sizeof(sa));
+            sa.sin_family = AF_INET; sa.sin_len = sizeof(sa);
+            if (inet_pton(AF_INET, src_ip, &sa.sin_addr) == 1) {
+                if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+                    if (dbg && dbg_n < 12) { fprintf(stderr, "ds4: [tp-connect-dbg] bind src %s errno=%s\n", src_ip, strerror(errno)); dbg_n++; }
+                } else if (dbg && dbg_n < 12) { fprintf(stderr, "ds4: [tp-connect-dbg] bound src=%s\n", src_ip); dbg_n++; }
+            }
+        }
+        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) {
+            if (dbg) {
+                struct sockaddr_storage ss; socklen_t sl = sizeof(ss); char sip[64] = "?";
+                if (getsockname(fd, (struct sockaddr *)&ss, &sl) == 0) {
+                    void *sa = ss.ss_family == AF_INET
+                        ? (void *)&((struct sockaddr_in *)&ss)->sin_addr
+                        : (void *)&((struct sockaddr_in6 *)&ss)->sin6_addr;
+                    inet_ntop(ss.ss_family, sa, sip, sizeof(sip));
+                }
+                fprintf(stderr, "ds4: [tp-connect-dbg] CONNECT OK src=%s\n", sip);
+            }
+            break;
+        }
         saved_errno = errno;
+        if (dbg && dbg_n < 12) { fprintf(stderr, "ds4: [tp-connect-dbg] connect errno=%s\n", strerror(saved_errno)); dbg_n++; }
         close(fd);
         fd = -1;
     }
@@ -1270,6 +1312,155 @@ static int dist_connect_endpoint(const char *host, int port, char *err, size_t e
         nanosleep(&ts, NULL);
     }
     return -1;
+}
+
+/* =========================================================================
+ * Tensor-parallel all-reduce transport (Stage 2 skeleton)
+ *
+ * Distinct from the layer-pipeline path below. A single persistent TCP socket
+ * connects the two TP peers. Per TP sync point each peer holds a partial
+ * [count] float vector (its ff-slice contribution to a layer's down_proj);
+ * ds4_dist_tp_allreduce_f32 exchanges and sums them so both peers end with the
+ * full vector. Two-node sum-all-reduce = a single ordered full exchange.
+ *
+ * Deadlock-safety: the listener side sends-then-receives, the connector side
+ * receives-then-sends, so a writer always has a reader draining the socket.
+ * Floats travel in host byte order — both peers are little-endian arm64 Macs,
+ * matching the activation-payload convention (control headers still use htonl).
+ * Buffers are KB-to-MB scratch, grown lazily and capped (no per-token alloc on
+ * the hot path, no model load — memory-safe by construction).
+ * ========================================================================= */
+
+#define DS4_DIST_TP_MAX_FLOATS (16u * 1024u * 1024u) /* 64 MiB scratch cap */
+
+struct ds4_dist_tp {
+    int fd;              /* peer socket (owned) */
+    bool send_first;     /* listener true, connector false */
+    float *recv_scratch; /* peer partial buffer, grown lazily */
+    uint32_t scratch_floats;
+};
+
+static int dist_tp_grow_scratch(ds4_dist_tp *tp, uint32_t count) {
+    if (count <= tp->scratch_floats) return 0;
+    if (count > DS4_DIST_TP_MAX_FLOATS) return -1;
+    float *p = realloc(tp->recv_scratch, (size_t)count * sizeof(float));
+    if (!p) return -1;
+    tp->recv_scratch = p;
+    tp->scratch_floats = count;
+    return 0;
+}
+
+static ds4_dist_tp *dist_tp_alloc(int fd, bool send_first) {
+    ds4_dist_tp *tp = calloc(1, sizeof(*tp));
+    if (!tp) { close(fd); return NULL; }
+    tp->fd = fd;
+    tp->send_first = send_first;
+    return tp;
+}
+
+ds4_dist_tp *ds4_dist_tp_listen(const char *host, int port, char *err, size_t errlen) {
+    int ls = dist_open_listener(host, port, err, errlen);
+    if (ls < 0) return NULL;
+    int fd = accept(ls, NULL, NULL);
+    close(ls);
+    if (fd < 0) {
+        if (errlen) snprintf(err, errlen, "tp accept failed: %s", strerror(errno));
+        return NULL;
+    }
+    dist_set_socket_low_latency(fd);
+    return dist_tp_alloc(fd, /*send_first=*/true);
+}
+
+ds4_dist_tp *ds4_dist_tp_connect(const char *host, int port, char *err, size_t errlen) {
+    int fd = dist_connect_endpoint(host, port, err, errlen);
+    if (fd < 0) return NULL;
+    return dist_tp_alloc(fd, /*send_first=*/false);
+}
+
+void ds4_dist_tp_free(ds4_dist_tp *tp) {
+    if (!tp) return;
+    if (tp->fd >= 0) close(tp->fd);
+    free(tp->recv_scratch);
+    free(tp);
+}
+
+/* One half of the exchange: read an ALLREDUCE frame of exactly `count` floats
+ * into recv_scratch. */
+static int dist_tp_recv_vec(ds4_dist_tp *tp, uint32_t count) {
+    uint32_t type = 0, bytes = 0;
+    char err[128];
+    int rc = dist_read_frame_header(tp->fd, &type, &bytes, err, sizeof(err));
+    if (rc <= 0) return -1;
+    if (type != DS4_DIST_MSG_ALLREDUCE || bytes != count * (uint32_t)sizeof(float)) return -1;
+    return dist_read_full(tp->fd, tp->recv_scratch, bytes) > 0 ? 0 : -1;
+}
+
+static int dist_tp_send_vec(ds4_dist_tp *tp, const float *buf, uint32_t count) {
+    if (dist_write_frame_header(tp->fd, DS4_DIST_MSG_ALLREDUCE,
+                                count * (uint32_t)sizeof(float)) != 0) return -1;
+    return dist_write_full(tp->fd, buf, count * (uint32_t)sizeof(float));
+}
+
+int ds4_dist_tp_allreduce_f32(ds4_dist_tp *tp, float *buf, uint32_t count) {
+    if (!tp || tp->fd < 0 || !buf || count == 0) return -1;
+    if (dist_tp_grow_scratch(tp, count) != 0) return -1;
+
+    if (tp->send_first) {
+        if (dist_tp_send_vec(tp, buf, count) != 0) return -1;
+        if (dist_tp_recv_vec(tp, count) != 0) return -1;
+    } else {
+        if (dist_tp_recv_vec(tp, count) != 0) return -1;
+        if (dist_tp_send_vec(tp, buf, count) != 0) return -1;
+    }
+    for (uint32_t i = 0; i < count; i++) buf[i] += tp->recv_scratch[i];
+    return 0;
+}
+
+/* Loopback self-test: two in-process peers over socketpair() verify the
+ * sum-all-reduce result and frame format. No model, no network, KB buffers. */
+typedef struct {
+    int fd;
+    bool send_first;
+    float *vec;
+    uint32_t count;
+    int rc;
+} dist_tp_selftest_arg;
+
+static void *dist_tp_selftest_thread(void *ud) {
+    dist_tp_selftest_arg *a = ud;
+    ds4_dist_tp *tp = dist_tp_alloc(a->fd, a->send_first);
+    a->fd = -1; /* ownership moved into tp */
+    if (!tp) { a->rc = -1; return NULL; }
+    a->rc = ds4_dist_tp_allreduce_f32(tp, a->vec, a->count);
+    ds4_dist_tp_free(tp);
+    return NULL;
+}
+
+int ds4_dist_tp_selftest(void) {
+    const uint32_t count = 4096; /* one n_embd vector */
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -1;
+
+    float *a = malloc(count * sizeof(float));
+    float *b = malloc(count * sizeof(float));
+    if (!a || !b) { free(a); free(b); close(sv[0]); close(sv[1]); return -1; }
+    for (uint32_t i = 0; i < count; i++) { a[i] = (float)i; b[i] = (float)(2 * i) + 1.0f; }
+
+    dist_tp_selftest_arg ta = { sv[0], true,  a, count, 0 };
+    dist_tp_selftest_arg tb = { sv[1], false, b, count, 0 };
+    pthread_t th;
+    pthread_create(&th, NULL, dist_tp_selftest_thread, &tb);
+    dist_tp_selftest_thread(&ta);
+    pthread_join(th, NULL);
+
+    int rc = (ta.rc == 0 && tb.rc == 0) ? 0 : -1;
+    for (uint32_t i = 0; rc == 0 && i < count; i++) {
+        float expect = (float)i + (float)(2 * i) + 1.0f; /* a[i]+b[i] */
+        if (a[i] != expect || b[i] != expect) { rc = -1; break; }
+    }
+    free(a);
+    free(b);
+    return rc;
 }
 
 /* =========================================================================
@@ -7872,6 +8063,13 @@ void ds4_dist_usage(FILE *fp) {
         "      Coordinator hidden-state transport width: 32, 16, or 8. Default: 32.\n"
         "  --dist-replay-check\n"
         "      Coordinator diagnostic: reset and replay the prompt, then compare logits.\n"
+        "  --tp\n"
+        "      Tensor-parallel mode (Stage 2 skeleton): both peers load the full\n"
+        "      model and split the MoE down_proj, summing partial outputs via an\n"
+        "      all-reduce. Use with --role coordinator/--listen and --role worker/--coordinator.\n"
+        "  --tp-layers N\n"
+        "      Apply the TP down_proj split only to the first N layers (implies --tp).\n"
+        "      0 (default with --tp) means all layers; small N brings the path up on 2-3 layers.\n"
         "  --debug\n"
         "      Print coordinator route/debug logs. Workers keep their normal logs without this.\n"
     );
@@ -8002,6 +8200,27 @@ ds4_dist_cli_parse_result ds4_dist_parse_cli_arg(
         opt->replay_check = true;
         return DS4_DIST_CLI_MATCHED;
     }
+    if (!strcmp(arg, "--tp")) {
+        if (!opt) {
+            if (errlen) snprintf(err, errlen, "missing distributed options");
+            return DS4_DIST_CLI_ERROR;
+        }
+        opt->tp_enabled = true;
+        return DS4_DIST_CLI_MATCHED;
+    }
+    if (!strcmp(arg, "--tp-layers")) {
+        if (!opt) {
+            if (errlen) snprintf(err, errlen, "missing distributed options");
+            return DS4_DIST_CLI_ERROR;
+        }
+        const char *value = dist_cli_need_arg(index, argc, argv, arg, err, errlen);
+        if (!value) return DS4_DIST_CLI_ERROR;
+        if (!dist_parse_positive_u32(value, arg, &opt->tp_layers, err, errlen)) {
+            return DS4_DIST_CLI_ERROR;
+        }
+        opt->tp_enabled = true; /* --tp-layers implies TP mode */
+        return DS4_DIST_CLI_MATCHED;
+    }
     if (!strcmp(arg, "--debug")) {
         if (!opt) {
             if (errlen) snprintf(err, errlen, "missing distributed options");
@@ -8030,7 +8249,10 @@ static int dist_validate_options(const ds4_dist_options *opt, char *err, size_t 
         return 0;
     }
 
-    if (!opt->layers.set) {
+    /* Tensor-parallel mode loads the whole model on every peer (it recombines
+     * routed_out element-wise, not by layer slice), so it does not take a
+     * --layers range. Pipeline (layer-slice) mode still requires it. */
+    if (!opt->layers.set && !opt->tp_enabled) {
         if (errlen) snprintf(err, errlen, "--role %s requires --layers", dist_role_name(opt->role));
         return 1;
     }
@@ -8043,7 +8265,23 @@ static int dist_validate_options(const ds4_dist_options *opt, char *err, size_t 
         return 1;
     }
 
+    /* TP reverse-connect (DS4_TP_REVERSE_CONNECT=1) flips network roles so the
+     * coordinator connects and the worker listens — used to dodge a host where
+     * one connect direction fails. The address flags swap accordingly. */
+    bool tp_rev = false;
+    if (opt->tp_enabled) {
+        const char *rev = getenv("DS4_TP_REVERSE_CONNECT");
+        tp_rev = (rev && *rev && rev[0] != '0');
+    }
+
     if (opt->role == DS4_DISTRIBUTED_COORDINATOR) {
+        if (tp_rev) {
+            if (!opt->coordinator_host || opt->coordinator_port <= 0) {
+                if (errlen) snprintf(err, errlen, "--role coordinator (TP reverse) requires --coordinator HOST PORT");
+                return 1;
+            }
+            return 0;
+        }
         if (!opt->listen_host || opt->listen_port <= 0) {
             if (errlen) snprintf(err, errlen, "--role coordinator requires --listen HOST PORT");
             return 1;
@@ -8056,6 +8294,13 @@ static int dist_validate_options(const ds4_dist_options *opt, char *err, size_t 
     }
 
     if (opt->role == DS4_DISTRIBUTED_WORKER) {
+        if (tp_rev) {
+            if (!opt->listen_host || opt->listen_port <= 0) {
+                if (errlen) snprintf(err, errlen, "--role worker (TP reverse) requires --listen HOST PORT");
+                return 1;
+            }
+            return 0;
+        }
         if (!opt->coordinator_host || opt->coordinator_port <= 0) {
             if (errlen) snprintf(err, errlen, "--role worker requires --coordinator HOST PORT");
             return 1;
@@ -8091,7 +8336,13 @@ int ds4_dist_prepare_engine_options(
     }
     if (engine && opt) {
         engine->distributed = *opt;
-        if (ds4_dist_enabled(opt)) {
+        if (opt->tp_enabled) {
+            /* Tensor parallelism replicates the whole layer stack on both peers
+             * and splits only the down_proj compute, so each machine must load
+             * the full model (no pipeline slice). */
+            engine->load_slice = false;
+            engine->load_output = true;
+        } else if (ds4_dist_enabled(opt)) {
             engine->load_slice = true;
             engine->load_layer_start = opt->layers.start;
             engine->load_layer_end = opt->layers.has_output ? UINT32_MAX : opt->layers.end;
@@ -8124,6 +8375,223 @@ static int dist_validate_layers_for_model(const ds4_dist_options *opt, uint32_t 
     return 0;
 }
 
+/* =========================================================================
+ * Tensor-parallel run loops (Stage 2). Both peers load the full model and run
+ * the same tokens in lockstep. The leader (coordinator) owns tokenization and
+ * greedy sampling and broadcasts each accepted token to the follower (worker)
+ * over the TP control socket; the MoE down_proj all-reduce inside the decode
+ * graph keeps them synchronized layer by layer. Prefill is replicated (batch
+ * path, no all-reduce) so both build identical KV before decode. Eval goes
+ * through the local slice primitive (full layer range) to bypass the pipeline.
+ * ========================================================================= */
+
+#define DS4_DIST_MSG_TP_PROMPT 11u
+#define DS4_DIST_MSG_TP_STEP   12u
+
+static int dist_tp_send_prompt(ds4_dist_tp *tp, const ds4_tokens *toks) {
+    int fd = tp->fd;
+    uint32_t n = (uint32_t)(toks->len > 0 ? toks->len : 0);
+    if (dist_write_frame_header(fd, DS4_DIST_MSG_TP_PROMPT,
+                                (uint32_t)((1u + n) * sizeof(uint32_t))) != 0) return -1;
+    uint32_t hdr = htonl(n);
+    if (dist_write_full(fd, &hdr, sizeof(hdr)) != 0) return -1;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t t = htonl((uint32_t)toks->v[i]);
+        if (dist_write_full(fd, &t, sizeof(t)) != 0) return -1;
+    }
+    return 0;
+}
+
+static int dist_tp_recv_prompt(ds4_dist_tp *tp, ds4_tokens *out) {
+    int fd = tp->fd;
+    uint32_t type = 0, bytes = 0;
+    char err[64];
+    if (dist_read_frame_header(fd, &type, &bytes, err, sizeof(err)) <= 0) return -1;
+    if (type != DS4_DIST_MSG_TP_PROMPT || bytes < sizeof(uint32_t)) return -1;
+    uint32_t n_net = 0;
+    if (dist_read_full(fd, &n_net, sizeof(n_net)) <= 0) return -1;
+    uint32_t n = ntohl(n_net);
+    if (bytes != (uint32_t)((1u + n) * sizeof(uint32_t))) return -1;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t t = 0;
+        if (dist_read_full(fd, &t, sizeof(t)) <= 0) return -1;
+        ds4_tokens_push(out, (int)(int32_t)ntohl(t));
+    }
+    return 0;
+}
+
+/* TP prefill feeds the whole prompt through all layers. With expert-offload the
+ * set of routed experts touched by a wide token batch can blow past a 16 GB
+ * GPU's wired limit, so feed the prompt in small chunks to bound the live
+ * expert working set. Tunable; small default keeps both peers (incl. M1 Pro)
+ * under the wired ceiling. */
+static uint32_t dist_tp_prefill_chunk(void) {
+    const char *e = getenv("DS4_TP_PREFILL_CHUNK");
+    if (e && *e) { long v = strtol(e, NULL, 10); if (v >= 1 && v <= 512) return (uint32_t)v; }
+    return 4u;
+}
+
+static int dist_tp_send_step(ds4_dist_tp *tp, int32_t token) {
+    int fd = tp->fd;
+    if (dist_write_frame_header(fd, DS4_DIST_MSG_TP_STEP, (uint32_t)sizeof(uint32_t)) != 0) return -1;
+    uint32_t v = htonl((uint32_t)token);
+    return dist_write_full(fd, &v, sizeof(v));
+}
+
+static int dist_tp_recv_step(ds4_dist_tp *tp, int32_t *token) {
+    int fd = tp->fd;
+    uint32_t type = 0, bytes = 0;
+    char err[64];
+    if (dist_read_frame_header(fd, &type, &bytes, err, sizeof(err)) <= 0) return -1;
+    if (type != DS4_DIST_MSG_TP_STEP || bytes != sizeof(uint32_t)) return -1;
+    uint32_t v = 0;
+    if (dist_read_full(fd, &v, sizeof(v)) <= 0) return -1;
+    *token = (int32_t)ntohl(v);
+    return 0;
+}
+
+static int dist_tp_argmax(const float *logits, int n) {
+    int best = 0;
+    float bv = logits[0];
+    for (int i = 1; i < n; i++) if (logits[i] > bv) { bv = logits[i]; best = i; }
+    return best;
+}
+
+static int dist_run_tp_leader(ds4_engine *engine, const ds4_dist_options *opt,
+                              const ds4_dist_generation_options *gen) {
+    char err[256];
+    ds4_session *session = NULL;
+    if (ds4_session_create(&session, engine, gen->ctx_size > 0 ? gen->ctx_size : 4096) != 0) {
+        fprintf(stderr, "ds4: TP leader: failed to create session\n");
+        return 1;
+    }
+    ds4_dist_tp *tp = ds4_engine_tp(engine);
+    if (!tp) { fprintf(stderr, "ds4: TP leader: no peer link\n"); ds4_session_free(session); return 1; }
+
+    ds4_tokens prompt = {0};
+    if (gen->prompt && dist_prompt_is_rendered_chat(gen->prompt))
+        ds4_tokenize_rendered_chat(engine, gen->prompt, &prompt);
+    else
+        ds4_encode_chat_prompt(engine, gen->system, gen->prompt, gen->think_mode, &prompt);
+    if (prompt.len <= 0) { fprintf(stderr, "ds4: TP leader: empty prompt\n"); ds4_session_free(session); return 1; }
+
+    if (dist_tp_send_prompt(tp, &prompt) != 0) {
+        fprintf(stderr, "ds4: TP leader: failed to send prompt\n");
+        ds4_tokens_free(&prompt); ds4_session_free(session); return 1;
+    }
+
+    const int vocab = ds4_engine_vocab_size(engine);
+    const uint32_t last_layer = (uint32_t)ds4_engine_layer_count(engine) - 1u;
+    float *logits = malloc((size_t)vocab * sizeof(float));
+    int rc = 1;
+    if (!logits) { ds4_tokens_free(&prompt); ds4_session_free(session); return 1; }
+
+    if (ds4_session_layer_slice_reset(session, err, sizeof(err)) != 0) {
+        fprintf(stderr, "ds4: TP leader: slice reset: %s\n", err);
+        goto leader_done;
+    }
+    double t_prefill0 = dist_now_sec();
+    uint32_t pchunk = dist_tp_prefill_chunk();
+    for (uint32_t off = 0; off < (uint32_t)prompt.len; off += pchunk) {
+        uint32_t n = (uint32_t)prompt.len - off;
+        if (n > pchunk) n = pchunk;
+        bool last = (off + n >= (uint32_t)prompt.len);
+        if (ds4_session_eval_layer_slice(session, prompt.v + off, n, off,
+                                         0, last_layer, NULL, NULL, last,
+                                         last ? logits : NULL, err, sizeof(err)) != 0) {
+            fprintf(stderr, "ds4: TP leader: prefill failed: %s\n", err);
+            goto leader_done;
+        }
+    }
+    double t_prefill = dist_now_sec() - t_prefill0;
+
+    int max_tokens = gen->n_predict > 0 ? gen->n_predict : 64;
+    uint32_t pos = (uint32_t)prompt.len;
+    int eos = ds4_token_eos(engine);
+    fprintf(stderr, "ds4: TP leader: prompt=%d tokens, generating up to %d (tp_layers=%u)\n",
+            prompt.len, max_tokens, opt->tp_layers ? opt->tp_layers : last_layer + 1u);
+    rc = 0;
+    double t_decode_sum = 0.0;   /* wall-clock spent inside eval_layer_slice during decode */
+    int decoded = 0;
+    for (int n = 0; n < max_tokens; n++) {
+        int token = dist_tp_argmax(logits, vocab);
+        if (token == eos) break;
+        if (dist_tp_send_step(tp, (int32_t)token) != 0) { fprintf(stderr, "ds4: TP leader: send step failed\n"); rc = 1; break; }
+        size_t tl = 0; char *txt = ds4_token_text(engine, token, &tl);
+        if (txt) { fwrite(txt, 1, tl, stdout); fflush(stdout); free(txt); }
+        double t_dec0 = dist_now_sec();
+        if (ds4_session_eval_layer_slice(session, &token, 1, pos, 0, last_layer,
+                                         NULL, NULL, true, logits, err, sizeof(err)) != 0) {
+            fprintf(stderr, "\nds4: TP leader: decode failed: %s\n", err);
+            rc = 1; break;
+        }
+        t_decode_sum += dist_now_sec() - t_dec0;
+        decoded++;
+        pos++;
+    }
+    dist_tp_send_step(tp, -1); /* signal follower to stop */
+    fputc('\n', stdout);
+    fprintf(stderr,
+            "ds4: TP leader: prefill %d tok in %.3fs (%.1f tok/s) | decode %d tok in %.3fs (%.2f tok/s)\n",
+            prompt.len, t_prefill, t_prefill > 0 ? prompt.len / t_prefill : 0.0,
+            decoded, t_decode_sum, t_decode_sum > 0 ? decoded / t_decode_sum : 0.0);
+leader_done:
+    free(logits);
+    ds4_tokens_free(&prompt);
+    ds4_session_free(session);
+    return rc;
+}
+
+static int dist_run_tp_follower(ds4_engine *engine, const ds4_dist_options *opt, int ctx_size) {
+    (void)opt;
+    char err[256];
+    ds4_session *session = NULL;
+    if (ds4_session_create(&session, engine, ctx_size > 0 ? ctx_size : 4096) != 0) {
+        fprintf(stderr, "ds4: TP follower: failed to create session\n");
+        return 1;
+    }
+    ds4_dist_tp *tp = ds4_engine_tp(engine);
+    if (!tp) { fprintf(stderr, "ds4: TP follower: no peer link\n"); ds4_session_free(session); return 1; }
+
+    ds4_tokens prompt = {0};
+    if (dist_tp_recv_prompt(tp, &prompt) != 0 || prompt.len <= 0) {
+        fprintf(stderr, "ds4: TP follower: failed to receive prompt\n");
+        ds4_tokens_free(&prompt); ds4_session_free(session); return 1;
+    }
+    const uint32_t last_layer = (uint32_t)ds4_engine_layer_count(engine) - 1u;
+    if (ds4_session_layer_slice_reset(session, err, sizeof(err)) != 0) {
+        fprintf(stderr, "ds4: TP follower: slice reset: %s\n", err);
+        ds4_tokens_free(&prompt); ds4_session_free(session); return 1;
+    }
+    uint32_t pchunk = dist_tp_prefill_chunk();
+    for (uint32_t off = 0; off < (uint32_t)prompt.len; off += pchunk) {
+        uint32_t n = (uint32_t)prompt.len - off;
+        if (n > pchunk) n = pchunk;
+        if (ds4_session_eval_layer_slice(session, prompt.v + off, n, off,
+                                         0, last_layer, NULL, NULL, false, NULL, err, sizeof(err)) != 0) {
+            fprintf(stderr, "ds4: TP follower: prefill failed: %s\n", err);
+            ds4_tokens_free(&prompt); ds4_session_free(session); return 1;
+        }
+    }
+    fprintf(stderr, "ds4: TP follower: prefilled %d prompt tokens, following leader\n", prompt.len);
+    uint32_t pos = (uint32_t)prompt.len;
+    for (;;) {
+        int32_t token = 0;
+        if (dist_tp_recv_step(tp, &token) != 0) { fprintf(stderr, "ds4: TP follower: recv step failed\n"); break; }
+        if (token < 0) break; /* leader signaled stop */
+        int token_i = (int)token;
+        if (ds4_session_eval_layer_slice(session, &token_i, 1, pos, 0, last_layer,
+                                         NULL, NULL, false, NULL, err, sizeof(err)) != 0) {
+            fprintf(stderr, "ds4: TP follower: decode failed: %s\n", err);
+            break;
+        }
+        pos++;
+    }
+    ds4_tokens_free(&prompt);
+    ds4_session_free(session);
+    return 0;
+}
+
 int ds4_dist_run(ds4_engine *engine, const ds4_dist_options *opt, const ds4_dist_generation_options *gen) {
     if (!engine || !opt) {
         fprintf(stderr, "ds4: distributed runtime requires an open engine and options\n");
@@ -8138,6 +8606,11 @@ int ds4_dist_run(ds4_engine *engine, const ds4_dist_options *opt, const ds4_dist
 
     signal(SIGPIPE, SIG_IGN);
 
+    if (opt->tp_enabled) {
+        if (opt->role == DS4_DISTRIBUTED_COORDINATOR) return dist_run_tp_leader(engine, opt, gen);
+        if (opt->role == DS4_DISTRIBUTED_WORKER) return dist_run_tp_follower(engine, opt, gen ? gen->ctx_size : 0);
+        return 1;
+    }
     if (opt->role == DS4_DISTRIBUTED_COORDINATOR) {
         return dist_run_coordinator(engine, opt, gen);
     }
