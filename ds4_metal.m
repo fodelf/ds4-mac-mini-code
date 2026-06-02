@@ -135,6 +135,13 @@ static id<MTLBuffer> g_moe_gate_scratch_buffer;
 static id<MTLBuffer> g_moe_down_scratch_buffer;
 static id<MTLBuffer> g_moe_id_map_buffer;
 static id<MTLBuffer> g_attn_out_group_ids_buffer;
+/* A3 routed-expert offload scratch.  When DS4_METAL_EXPERT_OFFLOAD=1 the
+ * routed MoE kernels read only the active expert slots copied from the GGUF mmap
+ * into these compact resident buffers, instead of binding the huge mmap-backed
+ * expert tensors to each command buffer. */
+static id<MTLBuffer> g_moe_scratch_gate;
+static id<MTLBuffer> g_moe_scratch_up;
+static id<MTLBuffer> g_moe_scratch_down;
 static const void *g_model_map_ptr;
 static uint64_t g_model_map_size;
 static uint64_t g_model_mapped_offset;
@@ -178,6 +185,9 @@ static NSUInteger g_moe_gate_scratch_bytes;
 static NSUInteger g_moe_down_scratch_bytes;
 static NSUInteger g_moe_id_map_bytes;
 static NSUInteger g_attn_out_group_ids_bytes;
+static NSUInteger g_moe_scratch_gate_bytes;
+static NSUInteger g_moe_scratch_up_bytes;
+static NSUInteger g_moe_scratch_down_bytes;
 static int g_initialized;
 static int g_quality_mode;
 static int g_mpp_invalid_env_reported;
@@ -1022,9 +1032,11 @@ static int ds4_gpu_warm_model_views(void) {
 
     uint64_t total_touches = 0;
     for (uint32_t i = 0; i < g_model_view_count; i++) {
+        if (!g_model_views[i].resident_hint) continue;
         total_touches += (g_model_views[i].bytes + stride - 1) / stride;
     }
-    if (total_touches == 0 || total_touches > (uint64_t)NSUIntegerMax) return 0;
+    if (total_touches == 0) return 1;
+    if (total_touches > (uint64_t)NSUIntegerMax) return 0;
 
     const NSUInteger out_bytes = (NSUInteger)total_touches;
     id<MTLBuffer> out = [g_device newBufferWithLength:out_bytes
@@ -1045,6 +1057,7 @@ static int ds4_gpu_warm_model_views(void) {
     [enc setComputePipelineState:pipeline];
     uint64_t dst_offset = 0;
     for (uint32_t i = 0; i < g_model_view_count; i++) {
+        if (!g_model_views[i].resident_hint) continue;
         const uint64_t bytes = g_model_views[i].bytes;
         const uint64_t n = (bytes + stride - 1) / stride;
         [enc setBuffer:g_model_views[i].buffer offset:0 atIndex:0];
@@ -4656,6 +4669,9 @@ void ds4_gpu_cleanup(void) {
         g_moe_down_scratch_buffer = nil;
         g_moe_id_map_buffer = nil;
         g_attn_out_group_ids_buffer = nil;
+        g_moe_scratch_gate = nil;
+        g_moe_scratch_up = nil;
+        g_moe_scratch_down = nil;
         g_model_map_ptr = NULL;
         g_model_map_size = 0;
         g_model_mapped_offset = 0;
@@ -4688,6 +4704,9 @@ void ds4_gpu_cleanup(void) {
         g_moe_down_scratch_bytes = 0;
         g_moe_id_map_bytes = 0;
         g_attn_out_group_ids_bytes = 0;
+        g_moe_scratch_gate_bytes = 0;
+        g_moe_scratch_up_bytes = 0;
+        g_moe_scratch_down_bytes = 0;
         g_model_wrap_count = 0;
         g_model_wrap_bytes = 0;
         g_model_wrap_max_bytes = 0;
@@ -14206,6 +14225,110 @@ int ds4_gpu_router_select_batch_tensor(
     return 1;
 }
 
+/* A3 expert offload: setting DS4_METAL_EXPERT_OFFLOAD=1 keeps routed expert
+ * mmap views out of the resident working set and CPU-gathers only the routed
+ * slots needed by this MoE call into small resident scratch buffers. */
+static int ds4_gpu_expert_offload_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("DS4_METAL_EXPERT_OFFLOAD");
+        cached = (v && v[0] && !(v[0] == '0' && v[1] == '\0')) ? 1 : 0;
+        if (cached) {
+            fprintf(stderr,
+                    "ds4: DS4_METAL_EXPERT_OFFLOAD=1: routed experts use A3 CPU-gather scratch; "
+                    "expert mmap views stay non-resident when the loader can split them.\n");
+        }
+    }
+    return cached;
+}
+
+static int ds4_gpu_load_layer_experts_to_scratch(
+        const void *model_map,
+        uint32_t    n_active,
+        const uint32_t *active_ids,
+        uint64_t    gate_offset,
+        uint64_t    up_offset,
+        uint64_t    down_offset,
+        uint64_t    gate_expert_bytes,
+        uint64_t    down_expert_bytes,
+        uint32_t    n_expert_total) {
+    if (!model_map || n_expert_total == 0 || !active_ids || n_active == 0) return 0;
+    const uint64_t gate_total = (uint64_t)n_active * gate_expert_bytes;
+    const uint64_t down_total = (uint64_t)n_active * down_expert_bytes;
+    if (gate_total > NSUIntegerMax || down_total > NSUIntegerMax) return 0;
+
+    if (!ds4_gpu_ensure_scratch_buffer(&g_moe_scratch_gate,
+                                       &g_moe_scratch_gate_bytes,
+                                       (NSUInteger)gate_total,
+                                       "ds4_moe_scratch_gate") ||
+        !ds4_gpu_ensure_scratch_buffer(&g_moe_scratch_up,
+                                       &g_moe_scratch_up_bytes,
+                                       (NSUInteger)gate_total,
+                                       "ds4_moe_scratch_up") ||
+        !ds4_gpu_ensure_scratch_buffer(&g_moe_scratch_down,
+                                       &g_moe_scratch_down_bytes,
+                                       (NSUInteger)down_total,
+                                       "ds4_moe_scratch_down")) {
+        return 0;
+    }
+
+    const uint8_t *map = (const uint8_t *)model_map;
+    uint8_t *gate_dst = (uint8_t *)g_moe_scratch_gate.contents;
+    uint8_t *up_dst = (uint8_t *)g_moe_scratch_up.contents;
+    uint8_t *down_dst = (uint8_t *)g_moe_scratch_down.contents;
+    if (!gate_dst || !up_dst || !down_dst) return 0;
+
+    for (uint32_t slot = 0; slot < n_active; slot++) {
+        const uint32_t id = active_ids[slot];
+        if (id >= n_expert_total) return 0;
+        const uint64_t gate_src = (uint64_t)id * gate_expert_bytes;
+        const uint64_t down_src = (uint64_t)id * down_expert_bytes;
+        const uint64_t gate_dst_off = (uint64_t)slot * gate_expert_bytes;
+        const uint64_t down_dst_off = (uint64_t)slot * down_expert_bytes;
+        memcpy(gate_dst + gate_dst_off, map + gate_offset + gate_src, (size_t)gate_expert_bytes);
+        memcpy(up_dst + gate_dst_off, map + up_offset + gate_src, (size_t)gate_expert_bytes);
+        memcpy(down_dst + down_dst_off, map + down_offset + down_src, (size_t)down_expert_bytes);
+    }
+    return 1;
+}
+
+static int ds4_gpu_compact_selected_experts(
+        id<MTLBuffer> selectedbuf,
+        NSUInteger    selected_off,
+        uint32_t      n_picks,
+        uint32_t      n_expert_total,
+        uint32_t     *active_ids,
+        uint32_t      active_cap,
+        uint32_t     *n_active_out) {
+    if (!selectedbuf || !active_ids || !n_active_out || active_cap == 0) return 0;
+    if (selectedbuf.storageMode != MTLStorageModeShared) {
+        fprintf(stderr,
+                "ds4: A3 expert offload requires Shared-storage selected buffer (got mode %lu)\n",
+                (unsigned long)selectedbuf.storageMode);
+        return 0;
+    }
+    if (n_expert_total == 0 || n_expert_total > active_cap) return 0;
+    int32_t *sel_cpu =
+        (int32_t *)((uint8_t *)selectedbuf.contents + (size_t)selected_off);
+    int16_t compact_lut[1024];
+    for (uint32_t i = 0; i < active_cap; i++) compact_lut[i] = -1;
+    uint32_t n_active = 0;
+    for (uint32_t i = 0; i < n_picks; i++) {
+        int32_t raw = sel_cpu[i];
+        uint32_t id = (raw >= 0 && (uint32_t)raw < n_expert_total) ? (uint32_t)raw : 0u;
+        int16_t slot = compact_lut[id];
+        if (slot < 0) {
+            if (n_active >= active_cap) return 0;
+            slot = (int16_t)n_active;
+            compact_lut[id] = slot;
+            active_ids[n_active++] = id;
+        }
+        sel_cpu[i] = (int32_t)slot;
+    }
+    *n_active_out = n_active;
+    return n_active != 0;
+}
+
 int ds4_gpu_routed_moe_one_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,
@@ -14247,6 +14370,7 @@ int ds4_gpu_routed_moe_one_tensor(
         id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
         id<MTLBuffer> expertsbuf = ds4_gpu_tensor_buffer(experts);
         id<MTLBuffer> selectedbuf = ds4_gpu_tensor_buffer(selected);
+        NSUInteger selected_off = ds4_gpu_tensor_offset(selected);
         id<MTLBuffer> weightsbuf = ds4_gpu_tensor_buffer(weights);
         const uint64_t x_bytes = (uint64_t)expert_in_dim * sizeof(float);
         const uint64_t mid_bytes = (uint64_t)n_expert * expert_mid_dim * sizeof(float);
@@ -14278,6 +14402,42 @@ int ds4_gpu_routed_moe_one_tensor(
         id<MTLBuffer> up_buf = ds4_gpu_wrap_model_range(model_map, model_size, up_offset, gate_tensor_bytes, &up_inner);
         id<MTLBuffer> down_buf = ds4_gpu_wrap_model_range(model_map, model_size, down_offset, down_tensor_bytes, &down_inner);
         if (!gate_buf || !up_buf || !down_buf) return 0;
+        uint32_t source_n_total_expert = n_total_expert;
+
+        if (ds4_gpu_expert_offload_enabled()) {
+            const int was_batched = (g_batch_cb != nil);
+            if (was_batched && ds4_gpu_end_commands() == 0) return 0;
+            uint32_t active_ids[1024];
+            uint32_t n_active = 0;
+            int load_ok = ds4_gpu_compact_selected_experts(selectedbuf,
+                                                           selected_off,
+                                                           n_expert,
+                                                           n_total_expert,
+                                                           active_ids,
+                                                           1024,
+                                                           &n_active) &&
+                          ds4_gpu_load_layer_experts_to_scratch(model_map,
+                                                                 n_active,
+                                                                 active_ids,
+                                                                 gate_offset,
+                                                                 up_offset,
+                                                                 down_offset,
+                                                                 gate_expert_bytes,
+                                                                 down_expert_bytes,
+                                                                 n_total_expert);
+            if (!load_ok) {
+                if (was_batched) (void)ds4_gpu_begin_commands();
+                return 0;
+            }
+            gate_buf = g_moe_scratch_gate;
+            up_buf = g_moe_scratch_up;
+            down_buf = g_moe_scratch_down;
+            gate_inner = 0;
+            up_inner = 0;
+            down_inner = 0;
+            source_n_total_expert = n_active;
+            if (was_batched && ds4_gpu_begin_commands() == 0) return 0;
+        }
 
         const uint32_t n_tokens = 1;
         const uint32_t pair_rows = n_tokens * n_expert;
@@ -14301,11 +14461,11 @@ int ds4_gpu_routed_moe_one_tensor(
         }
 
         ds4_gpu_mul_mv_id_args gate_args =
-            ds4_gpu_make_mul_mv_id_args(expert_in_dim, expert_mid_dim, n_total_expert,
+            ds4_gpu_make_mul_mv_id_args(expert_in_dim, expert_mid_dim, source_n_total_expert,
                                           gate_row_bytes, gate_expert_bytes,
                                           1, n_expert, n_tokens, gate_nr0);
         ds4_gpu_mul_mv_id_args down_args =
-            ds4_gpu_make_mul_mv_id_args(expert_mid_dim, out_dim, n_total_expert,
+            ds4_gpu_make_mul_mv_id_args(expert_mid_dim, out_dim, source_n_total_expert,
                                           down_row_bytes, down_expert_bytes,
                                           n_expert, n_expert, n_tokens, down_nr0);
 
@@ -14557,6 +14717,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
         id<MTLBuffer> expertsbuf = ds4_gpu_tensor_buffer(experts);
         id<MTLBuffer> selectedbuf = ds4_gpu_tensor_buffer(selected);
+        NSUInteger selected_off = ds4_gpu_tensor_offset(selected);
         id<MTLBuffer> weightsbuf = ds4_gpu_tensor_buffer(weights);
         const uint64_t x_bytes = (uint64_t)n_tokens * expert_in_dim * sizeof(float);
         const uint64_t mid_bytes = (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float);
@@ -14590,6 +14751,47 @@ int ds4_gpu_routed_moe_batch_tensor(
         id<MTLBuffer> up_buf = ds4_gpu_wrap_model_range(model_map, model_size, up_offset, gate_tensor_bytes, &up_inner);
         id<MTLBuffer> down_buf = ds4_gpu_wrap_model_range(model_map, model_size, down_offset, down_tensor_bytes, &down_inner);
         if (!gate_buf || !up_buf || !down_buf) return 0;
+        uint32_t source_n_total_expert = n_total_expert;
+
+        if (ds4_gpu_expert_offload_enabled()) {
+            const int was_batched = (g_batch_cb != nil);
+            if (was_batched && ds4_gpu_end_commands() == 0) return 0;
+            uint32_t active_ids[1024];
+            uint32_t n_active = 0;
+            const uint64_t total_picks_u64 = (uint64_t)n_tokens * n_expert;
+            if (total_picks_u64 > UINT32_MAX) {
+                if (was_batched) (void)ds4_gpu_begin_commands();
+                return 0;
+            }
+            int load_ok = ds4_gpu_compact_selected_experts(selectedbuf,
+                                                           selected_off,
+                                                           (uint32_t)total_picks_u64,
+                                                           n_total_expert,
+                                                           active_ids,
+                                                           1024,
+                                                           &n_active) &&
+                          ds4_gpu_load_layer_experts_to_scratch(model_map,
+                                                                 n_active,
+                                                                 active_ids,
+                                                                 gate_offset,
+                                                                 up_offset,
+                                                                 down_offset,
+                                                                 gate_expert_bytes,
+                                                                 down_expert_bytes,
+                                                                 n_total_expert);
+            if (!load_ok) {
+                if (was_batched) (void)ds4_gpu_begin_commands();
+                return 0;
+            }
+            gate_buf = g_moe_scratch_gate;
+            up_buf = g_moe_scratch_up;
+            down_buf = g_moe_scratch_down;
+            gate_inner = 0;
+            up_inner = 0;
+            down_inner = 0;
+            source_n_total_expert = n_active;
+            if (was_batched && ds4_gpu_begin_commands() == 0) return 0;
+        }
 
         const uint32_t pair_rows = n_tokens * n_expert;
         const uint64_t down_scratch_bytes = (uint64_t)pair_rows * out_dim * sizeof(float);
@@ -14615,11 +14817,11 @@ int ds4_gpu_routed_moe_batch_tensor(
         }
 
         ds4_gpu_mul_mv_id_args gate_args =
-            ds4_gpu_make_mul_mv_id_args(expert_in_dim, expert_mid_dim, n_total_expert,
+            ds4_gpu_make_mul_mv_id_args(expert_in_dim, expert_mid_dim, source_n_total_expert,
                                           gate_row_bytes, gate_expert_bytes,
                                           1, n_expert, n_tokens, gate_nr0);
         ds4_gpu_mul_mv_id_args down_args =
-            ds4_gpu_make_mul_mv_id_args(expert_mid_dim, out_dim, n_total_expert,
+            ds4_gpu_make_mul_mv_id_args(expert_mid_dim, out_dim, source_n_total_expert,
                                           down_row_bytes, down_expert_bytes,
                                           n_expert, n_expert, n_tokens, down_nr0);
         const bool use_mm_id = n_tokens >= 32u && ds4_gpu_mul_mm_id_map0_name(n_expert) != NULL;
@@ -14652,13 +14854,13 @@ int ds4_gpu_routed_moe_batch_tensor(
         const bool request_mid_f16 = !g_quality_mode;
         if (use_mm_id) {
             gate_map_args =
-                ds4_gpu_make_mul_mm_id_map_args(expert_in_dim, n_total_expert, 1, n_expert, n_tokens);
+                ds4_gpu_make_mul_mm_id_map_args(expert_in_dim, source_n_total_expert, 1, n_expert, n_tokens);
             gate_mm_args =
-                ds4_gpu_make_mul_mm_id_args(expert_in_dim, expert_mid_dim, n_total_expert,
+                ds4_gpu_make_mul_mm_id_args(expert_in_dim, expert_mid_dim, source_n_total_expert,
                                               gate_row_bytes, gate_expert_bytes,
                                               1, n_expert, n_tokens);
             down_mm_args =
-                ds4_gpu_make_mul_mm_id_args_src1_size(expert_mid_dim, out_dim, n_total_expert,
+                ds4_gpu_make_mul_mm_id_args_src1_size(expert_mid_dim, out_dim, source_n_total_expert,
                                                         down_row_bytes, down_expert_bytes,
                                                         n_expert, n_expert, n_tokens,
                                                         request_mid_f16 ? sizeof(uint16_t) : sizeof(float));

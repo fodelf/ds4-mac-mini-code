@@ -3607,6 +3607,37 @@ static bool weights_model_map_spans_split(
     return true;
 }
 
+static bool weights_model_map_spans_split_slice(
+        const ds4_weights *w,
+        uint32_t layer_start,
+        uint32_t layer_end,
+        bool include_output,
+        bool include_token_embd,
+        ds4_model_map_span_vec *backbone,
+        ds4_model_map_span_vec *experts) {
+    if (!w || !backbone || !experts) return false;
+    if (layer_start >= DS4_N_LAYER) return false;
+    if (layer_end == UINT32_MAX) layer_end = DS4_N_LAYER - 1u;
+    if (layer_end >= DS4_N_LAYER || layer_end < layer_start) return false;
+
+    memset(backbone, 0, sizeof(*backbone));
+    memset(experts, 0, sizeof(*experts));
+    if (layer_start == 0 || include_token_embd) {
+        model_map_span_vec_include_one(backbone, w->token_embd);
+    }
+    for (uint32_t il = layer_start; il <= layer_end; il++) {
+        model_map_span_vec_split_layer(backbone, experts, &w->layer[il]);
+    }
+    if (include_output) model_map_span_vec_include_output(backbone, w);
+
+    model_map_span_vec_finalize(backbone);
+    model_map_span_vec_finalize(experts);
+
+    if (backbone->len == 0 || experts->len == 0) return false;
+    if (backbone->max_tensor_bytes == 0) return false;
+    return true;
+}
+
 static void mtp_weights_bind(ds4_mtp_weights *w, const ds4_model *m) {
     memset(w, 0, sizeof(*w));
 
@@ -19227,6 +19258,12 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         ds4_gpu_set_quality(e->quality);
         (void)ds4_gpu_set_model_fd(e->model.fd);
         int model_map_ok = 0;
+        uint64_t base_l1_resident_bytes = 0;
+        const uint64_t mtp_l1_resident_bytes = e->mtp_ready ?
+            e->mtp_model.size - e->mtp_model.tensor_data_pos : 0;
+        const char *expert_offload_env = getenv("DS4_METAL_EXPERT_OFFLOAD");
+        const bool expert_offload_requested = expert_offload_env && expert_offload_env[0] &&
+            !(expert_offload_env[0] == '0' && expert_offload_env[1] == '\0');
         if (load_slice) {
             char load_end[32];
             if (load_output && load_layer_end == UINT32_MAX) {
@@ -19237,47 +19274,114 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 snprintf(load_end, sizeof(load_end), "%u", load_layer_end);
             }
 
-            ds4_model_map_span_vec spans;
-            if (!weights_model_map_spans(&e->weights,
-                                         load_layer_start,
-                                         load_layer_end,
-                                         load_output,
-                                         mtp_for_worker_draft,
-                                         &spans))
-            {
-                fprintf(stderr, "ds4: invalid model load layer slice %u:%s\n",
+            if (expert_offload_requested) {
+                ds4_model_map_span_vec bb, exp;
+                if (!weights_model_map_spans_split_slice(&e->weights,
+                                                         load_layer_start,
+                                                         load_layer_end,
+                                                         load_output,
+                                                         mtp_for_worker_draft,
+                                                         &bb,
+                                                         &exp))
+                {
+                    fprintf(stderr, "ds4: invalid expert-offload model load layer slice %u:%s\n",
+                            load_layer_start,
+                            load_end);
+                    ds4_engine_close(e);
+                    *out = NULL;
+                    return 1;
+                }
+                const uint32_t total = bb.len + exp.len;
+                uint64_t *offsets = xmalloc((size_t)total * sizeof(offsets[0]));
+                uint64_t *sizes = xmalloc((size_t)total * sizeof(sizes[0]));
+                bool *resident = xmalloc((size_t)total * sizeof(resident[0]));
+                uint64_t resident_bytes = 0, reclaimable_bytes = 0;
+                uint32_t n = 0;
+                for (uint32_t i = 0; i < bb.len; i++) {
+                    offsets[n] = bb.v[i].off;
+                    sizes[n] = bb.v[i].end - bb.v[i].off;
+                    resident[n] = true;
+                    resident_bytes += sizes[n];
+                    n++;
+                }
+                for (uint32_t i = 0; i < exp.len; i++) {
+                    offsets[n] = exp.v[i].off;
+                    sizes[n] = exp.v[i].end - exp.v[i].off;
+                    resident[n] = false;
+                    reclaimable_bytes += sizes[n];
+                    n++;
+                }
+                uint64_t split_max_tensor = bb.max_tensor_bytes;
+                if (exp.max_tensor_bytes > split_max_tensor) split_max_tensor = exp.max_tensor_bytes;
+                base_l1_resident_bytes = resident_bytes;
+                fprintf(stderr,
+                        "ds4: restricting %s model map to layers %u:%s with expert offload "
+                        "(%.2f GiB backbone resident, %.2f GiB routed experts reclaimable; "
+                        "%u backbone + %u expert spans)\n",
+                        ds4_backend_name(e->backend),
                         load_layer_start,
-                        load_end);
-                ds4_engine_close(e);
-                *out = NULL;
-                return 1;
+                        load_end,
+                        (double)resident_bytes / 1073741824.0,
+                        (double)reclaimable_bytes / 1073741824.0,
+                        bb.len,
+                        exp.len);
+                ds4_l1_budget_gate(base_l1_resident_bytes + mtp_l1_resident_bytes, 0);
+                model_map_ok = ds4_gpu_set_model_map_spans_split(e->model.map,
+                                                                 e->model.size,
+                                                                 offsets,
+                                                                 sizes,
+                                                                 resident,
+                                                                 total,
+                                                                 split_max_tensor);
+                free(offsets);
+                free(sizes);
+                free(resident);
+                free(bb.v);
+                free(exp.v);
+            } else {
+                ds4_model_map_span_vec spans;
+                if (!weights_model_map_spans(&e->weights,
+                                             load_layer_start,
+                                             load_layer_end,
+                                             load_output,
+                                             mtp_for_worker_draft,
+                                             &spans))
+                {
+                    fprintf(stderr, "ds4: invalid model load layer slice %u:%s\n",
+                            load_layer_start,
+                            load_end);
+                    ds4_engine_close(e);
+                    *out = NULL;
+                    return 1;
+                }
+                uint64_t *offsets = xmalloc((size_t)spans.len * sizeof(offsets[0]));
+                uint64_t *sizes = xmalloc((size_t)spans.len * sizeof(sizes[0]));
+                uint64_t span_bytes = 0;
+                for (uint32_t i = 0; i < spans.len; i++) {
+                    offsets[i] = spans.v[i].off;
+                    sizes[i] = spans.v[i].end - spans.v[i].off;
+                    span_bytes += sizes[i];
+                }
+                base_l1_resident_bytes = span_bytes;
+                fprintf(stderr,
+                        "ds4: restricting %s model map to layers %u:%s (%u spans, %.2f GiB tensor span)\n",
+                        ds4_backend_name(e->backend),
+                        load_layer_start,
+                        load_end,
+                        spans.len,
+                        (double)span_bytes / 1073741824.0);
+                ds4_l1_budget_gate(base_l1_resident_bytes + mtp_l1_resident_bytes, 0);
+                model_map_ok = ds4_gpu_set_model_map_spans(e->model.map,
+                                                            e->model.size,
+                                                            offsets,
+                                                            sizes,
+                                                            spans.len,
+                                                            spans.max_tensor_bytes);
+                free(offsets);
+                free(sizes);
+                free(spans.v);
             }
-            uint64_t *offsets = xmalloc((size_t)spans.len * sizeof(offsets[0]));
-            uint64_t *sizes = xmalloc((size_t)spans.len * sizeof(sizes[0]));
-            uint64_t span_bytes = 0;
-            for (uint32_t i = 0; i < spans.len; i++) {
-                offsets[i] = spans.v[i].off;
-                sizes[i] = spans.v[i].end - spans.v[i].off;
-                span_bytes += sizes[i];
-            }
-            fprintf(stderr,
-                    "ds4: restricting %s model map to layers %u:%s (%u spans, %.2f GiB tensor span)\n",
-                    ds4_backend_name(e->backend),
-                    load_layer_start,
-                    load_end,
-                    spans.len,
-                    (double)span_bytes / 1073741824.0);
-            ds4_l1_budget_gate(span_bytes, 0);
-            model_map_ok = ds4_gpu_set_model_map_spans(e->model.map,
-                                                        e->model.size,
-                                                        offsets,
-                                                        sizes,
-                                                        spans.len,
-                                                        spans.max_tensor_bytes);
-            free(offsets);
-            free(sizes);
-            free(spans.v);
-        } else if (getenv("DS4_METAL_EXPERT_OFFLOAD") != NULL) {
+        } else if (expert_offload_requested) {
             /* Reduced-memory load: wire only the backbone (attn / shared FFN /
              * embedding / output) into the GPU residency set and keep the routed
              * experts reclaimable. The hot path still resolves every tensor's
@@ -19287,6 +19391,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 fprintf(stderr,
                         "ds4: DS4_METAL_EXPERT_OFFLOAD requested but span split failed; "
                         "falling back to the full-residency loader\n");
+                base_l1_resident_bytes = e->model.size - e->model.tensor_data_pos;
+                ds4_l1_budget_gate(base_l1_resident_bytes + mtp_l1_resident_bytes, 0);
                 model_map_ok = ds4_gpu_set_model_map_range(e->model.map,
                                                            e->model.size,
                                                            e->model.tensor_data_pos,
@@ -19321,7 +19427,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                         (double)resident_bytes / 1073741824.0,
                         (double)reclaimable_bytes / 1073741824.0,
                         bb.len, exp.len);
-                ds4_l1_budget_gate(resident_bytes, 0);
+                base_l1_resident_bytes = resident_bytes;
+                ds4_l1_budget_gate(base_l1_resident_bytes + mtp_l1_resident_bytes, 0);
                 if (getenv("DS4_METAL_EXPERT_OFFLOAD_DEBUG") != NULL) {
                     for (uint32_t i = 0; i < total; i++) {
                         fprintf(stderr, "ds4:   span[%u] %s %.4f..%.4f GiB (%.1f MiB)\n",
@@ -19345,7 +19452,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 free(exp.v);
             }
         } else {
-            ds4_l1_budget_gate(e->model.size - e->model.tensor_data_pos, 0);
+            base_l1_resident_bytes = e->model.size - e->model.tensor_data_pos;
+            ds4_l1_budget_gate(base_l1_resident_bytes + mtp_l1_resident_bytes, 0);
             model_map_ok = ds4_gpu_set_model_map_range(e->model.map,
                                                        e->model.size,
                                                        e->model.tensor_data_pos,
@@ -19360,12 +19468,6 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             ds4_engine_close(e);
             *out = NULL;
             return 1;
-        }
-        /* The base model map already passed the L1 gate above, but the MTP draft
-         * model adds its own resident span that was previously unaccounted for.
-         * Surface it so the planned-resident footprint reflects base+MTP. */
-        if (e->mtp_ready) {
-            ds4_l1_budget_gate(e->mtp_model.size - e->mtp_model.tensor_data_pos, 0);
         }
         if (e->mtp_ready &&
             !ds4_gpu_set_model_map_range(e->mtp_model.map,

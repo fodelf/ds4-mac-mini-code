@@ -1294,3 +1294,30 @@ M4 coordinator --coordinator 192.168.1.2 5599 后拨; RUN_ENV=DS4_DIST_REVERSE_C
 **对测速目标的影响**: k4 退化模型 + 真 prompt 永远第一步 EOS, 测不到 decode t/s。ds4 当前无 --ignore-eos/min-tokens 开关。要测双机 decode 速度需加 --ignore-eos (或 DS4_IGNORE_EOS env) 在 ds4_cli.c:597/633 两处 EOS 判断加门控强制生成 N token。待用户确认是否加。
 
 **遗留埋点**: DS4_DECODE_DIAG (ds4_cli.c + ds4.c), DS4_METAL 残留 [diag] (residency/CB-fail), 均 env 门控/低噪, 待定是否收编进统一 DS4_*_DIAG 开关。
+
+## 2026-06-02 q2 双机 layer-slice + MTP worker 内存安全补丁
+
+**范围**: 为 `tools/mtp_pipe_k4_speed.sh` 默认 q2 双机场景做最小修复：本机 coordinator 0:32（33 层, 约 12GB 预算），M1 worker 33:output（10 层 + output + MTP, 约 8GB 预算）。用户自己运行脚本；本次不加载模型、不跑双机 smoke。
+
+**问题定位**:
+- 当前 `--layers` load-slice 会把切片内 `ffn_gate_exps/up_exps/down_exps` 全部纳入 resident spans；q2 routed experts 是模型主体，MTP worker 再叠 3.5GiB MTP，8GB 目标会被 full-resident expert views 撞爆。
+- `DS4_METAL_EXPERT_OFFLOAD` 原只在非 layer-slice 分支生效；双机 layer-pipeline 没有 A3 按需专家加载。
+- Metal warmup 原会触碰所有 model views；对 non-resident expert views 也 warm 会把冷专家页提前扫进来，违背按需加载目的。
+
+**落地**:
+- `ds4_metal.m`: 移植 mine 分支 A3 的最小形态：`DS4_METAL_EXPERT_OFFLOAD=1` 时，decode 读回 6 个 selected expert id，prefill/MTP verify 对 `n_tokens * topK` selected ids 去重，然后只 memcpy 活跃 expert slots 到 resident compact scratch (`gate/up/down`)；selected ids 原地改写为 compact slot，非 A3 路径不变。
+- `ds4_metal.m`: warmup 跳过 `resident_hint=false` 的 routed expert views，避免启动时扫冷 expert。
+- `ds4.c`: 新增 layer-slice split spans；`load_slice && DS4_METAL_EXPERT_OFFLOAD` 时 backbone/embedding/output/shared expert 常驻，`ffn_*_exps` 只 wrap 不加入 residency set。L1 gate 按 base resident + MTP resident 累计预算检查。
+- `tools/mtp_pipe_k4_speed.sh`: 默认 q2-imatrix、`SPLIT_COORD=0:32`、`SPLIT_WORKER=33:output`、12GB/8GB 预算；默认 RUN_ENV 带 `DS4_DIST_REVERSE_CONNECT=1 DS4_METAL_PREFILL_CHUNK=512 DS4_METAL_EXPERT_OFFLOAD=1 DS4_METAL_NO_MODEL_WARMUP=1`。Ctrl+C/EXIT 继续两边同杀，只杀进程不删文件；远端优先 kill 本脚本写入的 worker PID，再 fallback pkill。
+
+**安全边界**:
+- 仍保持 GGUF mmap-backed；没有 eager copy 整模型。
+- A3 会引入每层 CB sync + CPU memcpy，速度可能慢；本补丁目标是先保证 q2 双机不崩并能输出 token。
+- 若 10 层 + MTP 的 resident backbone 仍超过 8GB，L1 gate 应拒绝启动；可用 `SPLIT_WORKER=36:output` 或 `NO_MTP=1` 隔离。
+- 本次只做编译/脚本语法验证，不运行任何会加载模型的命令。
+
+
+**非模型验证 (2026-06-02)**:
+- `make ds4` 通过（只编译，不加载模型）。
+- `bash -n tools/mtp_pipe_k4_speed.sh` 通过。
+- 未运行 `./ds4` / 未启动双机脚本 / 未 ssh 加载模型；脚本按用户要求留给用户自己跑。

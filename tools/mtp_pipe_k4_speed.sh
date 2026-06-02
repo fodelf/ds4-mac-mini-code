@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 双机 *层切分(layer-pipeline) + MTP 跨机投机* k4 测速/正确性脚本 (mtp.md Phase 1 方案A)。
+# 双机 *层切分(layer-pipeline) + MTP 跨机投机* q2 smoke/测速脚本 (mtp.md Phase 1 方案A)。
 #
 # 拓扑 (本机 M4 扛大部分层, M1 扛 MTP + 少部分末段层):
 #   本机 M4 = coordinator: 持前段 *大部分* 层 (0:N) + token_embd, 做 tokenize/sample/编排,
@@ -30,16 +30,14 @@ REMOTE_DIR=${REMOTE_DIR:-/Users/fodelf/ds4-main}
 LOCAL_DIR=${LOCAL_DIR:-/Users/fodelf/git/ds4-main}
 WORKER_IP=${WORKER_IP:-192.168.1.2}            # M1 雷电 IP: worker 在此 listen 控制端口, M4 coordinator 拨此
 PORT=${PORT:-5599}
-# 档位: k4(4/256 退化,首token即EOS,无法测decode) / k16(16/256 能出token,双机可跑通) /
-# k48(48/256,质量最好但 23.4G, 43 层装不进两台 16GB 合计 GPU 工作集 ~22.5 GiB, 大概率 OOM)。
-# k16 (13G) 比 k4 大, worker 切片+MTP 常驻更高, 若 M1 GPU OOM 需调小 PREFILL_CHUNK 或给 worker
-# 更少层 (SPLIT_WORKER)。两机各自从同一 gguf 加载自己那段层切片。
-# 跑 k48 (有风险): MODEL=gguf/ds4flash-k48.gguf SPLIT_COORD=0:20 SPLIT_WORKER=21:output NO_MTP=1 覆盖。
-MODEL=${MODEL:-gguf/ds4flash-k16.gguf}
+# 档位: 默认 q2-imatrix 完整模型；脚本只做双机层切分 + A3 按需专家加载 smoke。
+# 本机默认 0:32 共 33 层，M1 默认 33:output 共 10 层 + output + MTP。若 M1 8GB
+# 预算闸拒绝加载，先用 SPLIT_WORKER=36:output 或 NO_MTP=1 做隔离。
+MODEL=${MODEL:-gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf}
 MTP_GGUF=${MTP_GGUF:-gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf} # 草稿模型, 仅 M1 worker 加载
 # 层切分 (block_count=43, layers 0..42)。本机 M4 扛大部分前段, M1 扛少部分末段 + output + MTP。
-SPLIT_COORD=${SPLIT_COORD:-0:32}               # 本机 M4 coordinator 层切片 (前段, 大部分)
-SPLIT_WORKER=${SPLIT_WORKER:-33:output}        # M1 worker 层切片 (末段, 少部分 + output, 持 MTP)
+SPLIT_COORD=${SPLIT_COORD:-0:33}               # 本机 M4 coordinator 层切片 (前段, 大部分)
+SPLIT_WORKER=${SPLIT_WORKER:-34:output}        # M1 worker 层切片 (末段, 少部分 + output, 持 MTP)
 CTX=${CTX:-4096}
 NPRED=${NPRED:-128}
 DRAFT=${DRAFT:-4}                              # --mtp-draft N: 投机批量 K (>=2 才有意义)
@@ -53,10 +51,10 @@ else
 fi
 PROMPT=${PROMPT:-"写一个 Python 函数判断字符串是否回文，并解释它的原理。"}
 SEED=${SEED:-1}
-LOCAL_MAX_GB=${LOCAL_MAX_GB:-14}
-REMOTE_MAX_GB=${REMOTE_MAX_GB:-14}
-LOCAL_BUDGET_MB=${LOCAL_BUDGET_MB:-13500}
-REMOTE_BUDGET_MB=${REMOTE_BUDGET_MB:-13500}
+LOCAL_MAX_GB=${LOCAL_MAX_GB:-12}
+REMOTE_MAX_GB=${REMOTE_MAX_GB:-8}
+LOCAL_BUDGET_MB=${LOCAL_BUDGET_MB:-12000}
+REMOTE_BUDGET_MB=${REMOTE_BUDGET_MB:-8000}
 # Metal prefill scratch chunk。默认 4096 会让 M1 worker 单个命令缓冲的 wired working set
 # (模型常驻 ~6.88G + scratch 池) 越过 M1 Pro GPU 的 ~10.67G 工作集天花板 → kIOGPU OOM
 # (= 曾经"本机爆了"的真因; 实测 currentAllocated 11.23G > recommendedMax 10.67G)。prompt 短时
@@ -65,10 +63,12 @@ REMOTE_BUDGET_MB=${REMOTE_BUDGET_MB:-13500}
 PREFILL_CHUNK=${PREFILL_CHUNK:-512}
 # reverse-connect 是本拓扑的核心 (见顶部注释)。两机都要带。
 # DS4_METAL_PREFILL_CHUNK 限制 prefill scratch, 防 M1 worker GPU 命令缓冲 OOM (见上)。
-RUN_ENV=${RUN_ENV:-"DS4_DIST_REVERSE_CONNECT=1 DS4_METAL_PREFILL_CHUNK=$PREFILL_CHUNK"}
+# DS4_METAL_EXPERT_OFFLOAD 让 q2 routed experts 走 A3 按需 scratch; NO_MODEL_WARMUP 避免启动时扫冷 expert views。
+RUN_ENV=${RUN_ENV:-"DS4_DIST_REVERSE_CONNECT=1 DS4_METAL_PREFILL_CHUNK=$PREFILL_CHUNK DS4_METAL_EXPERT_OFFLOAD=1 DS4_METAL_NO_MODEL_WARMUP=1"}
 
 COORD_LOG=/tmp/mtp_pipe_coord.log              # 本机 M4 路径 (coordinator)
 WORKER_LOG=/tmp/mtp_pipe_worker.log            # M1 上的路径 (worker)
+WORKER_PID_FILE=/tmp/mtp_pipe_worker.pid        # M1 上本脚本启动的 worker pid
 COORD_PID=""
 
 log(){ echo "[mtp-pipe] $*"; }
@@ -79,8 +79,8 @@ cleanup(){
   echo
   log "cleanup: 杀两边 ds4 进程 (只杀进程, 不删任何文件)"
   [ -n "$COORD_PID" ] && kill "$COORD_PID" 2>/dev/null || true
+  ssh "$REMOTE" "pid=\$(cat '$WORKER_PID_FILE' 2>/dev/null); [ -n \"\$pid\" ] && kill \"\$pid\" 2>/dev/null || true; pkill -f 'ds4 -m' 2>/dev/null || true" 2>/dev/null || true
   pkill -f 'ds4 -m' 2>/dev/null || true
-  ssh "$REMOTE" 'pkill -f "ds4 -m" 2>/dev/null' 2>/dev/null || true
   log "done."
 }
 trap cleanup INT TERM EXIT
@@ -88,7 +88,7 @@ trap cleanup INT TERM EXIT
 # ---------------- RSS (GiB) ----------------
 rss_gb_local(){ local kb; kb=$(ps -o rss= -p "$1" 2>/dev/null | tr -d ' '); [ -n "$kb" ] && awk "BEGIN{printf \"%.2f\",$kb/1048576}" || echo 0; }
 rss_gb_remote(){
-  local kb; kb=$(ssh "$REMOTE" "pid=\$(pgrep -f 'ds4 -m' | head -1); [ -n \"\$pid\" ] && ps -o rss= -p \$pid 2>/dev/null | tr -d ' '" 2>/dev/null)
+  local kb; kb=$(ssh "$REMOTE" "pid=\$(cat '$WORKER_PID_FILE' 2>/dev/null); [ -z \"\$pid\" ] && pid=\$(pgrep -f 'ds4 -m' | head -1); [ -n \"\$pid\" ] && ps -o rss= -p \$pid 2>/dev/null | tr -d ' '" 2>/dev/null)
   [ -n "$kb" ] && awk "BEGIN{printf \"%.2f\",$kb/1048576}" || echo 0
 }
 over(){ awk "BEGIN{a=$1+0;b=$2+0;exit !(a>b)}"; }
@@ -126,7 +126,7 @@ ssh "$REMOTE" "cd '$REMOTE_DIR' && rm -f '$WORKER_LOG'; \
   $RUN_ENV DS4_MEM_BUDGET_MB=$REMOTE_BUDGET_MB \
   nohup ./ds4 -m '$MODEL' --role worker --listen '$WORKER_IP' '$PORT' \
   --layers '$SPLIT_WORKER' $WORKER_MTP_ARGS \
-  -c '$CTX' --temp 0 --nothink > '$WORKER_LOG' 2>&1 & echo launched" 2>/dev/null
+  -c '$CTX' --temp 0 --nothink > '$WORKER_LOG' 2>&1 & echo \$! > '$WORKER_PID_FILE'; echo launched" 2>/dev/null
 
 log "等 M1 worker backend 就绪并开始 control listen…"
 wok=0
