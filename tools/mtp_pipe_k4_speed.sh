@@ -61,12 +61,64 @@ REMOTE_BUDGET_MB=${REMOTE_BUDGET_MB:-8000}
 # 4096 的 scratch 几乎全浪费; 512 缩小 scratch 池, worker 不再 OOM (实测 coordinator prefill 21.5 t/s)。
 # 要更大上下文/吞吐再上调并实测。
 PREFILL_CHUNK=${PREFILL_CHUNK:-512}
+# 源页保活 LRU：不复制 expert 到大 MTLBuffer，而是对 GGUF mmap 源页做 madvise/可选 mlock，
+# 继续走 compact scratch kernel。目标是减少 page fault / 慢 IO，同时避免大副本池污染内存。
+LOCAL_EXPERT_SOURCE_CACHE_MB=${LOCAL_EXPERT_SOURCE_CACHE_MB:-2048}
+REMOTE_EXPERT_SOURCE_CACHE_MB=${REMOTE_EXPERT_SOURCE_CACHE_MB:-0}
+LOCAL_EXPERT_SOURCE_CACHE_LAYER_START=${LOCAL_EXPERT_SOURCE_CACHE_LAYER_START:-3}
+LOCAL_EXPERT_SOURCE_CACHE_LAYER_END=${LOCAL_EXPERT_SOURCE_CACHE_LAYER_END:-33}
+REMOTE_EXPERT_SOURCE_CACHE_LAYER_START=${REMOTE_EXPERT_SOURCE_CACHE_LAYER_START:-34}
+REMOTE_EXPERT_SOURCE_CACHE_LAYER_END=${REMOTE_EXPERT_SOURCE_CACHE_LAYER_END:-42}
+EXPERT_SOURCE_CACHE_ADMIT_AFTER=${EXPERT_SOURCE_CACHE_ADMIT_AFTER:-2}
+EXPERT_SOURCE_CACHE_MLOCK=${EXPERT_SOURCE_CACHE_MLOCK:-0}
+# 真实 expert pool：hit 时绕过 A3 scratch copy，直接让 MoE kernel 读 resident pool。
+# v1 不再全层 admission：早期层日志显示局部性差，会污染大池并拉低 copy 带宽；默认只缓存
+# coordinator 后段高命中层 24..33。M1 worker 默认不开，避免超过 8GiB。
+# 这是实际分配内存，不是模拟。若本机看门狗超限会两边同杀。
+LOCAL_EXPERT_POOL_MB=${LOCAL_EXPERT_POOL_MB:-0}
+REMOTE_EXPERT_POOL_MB=${REMOTE_EXPERT_POOL_MB:-0}
+LOCAL_EXPERT_POOL_LAYER_START=${LOCAL_EXPERT_POOL_LAYER_START:-24}
+LOCAL_EXPERT_POOL_LAYER_END=${LOCAL_EXPERT_POOL_LAYER_END:-33}
+REMOTE_EXPERT_POOL_LAYER_START=${REMOTE_EXPERT_POOL_LAYER_START:-34}
+REMOTE_EXPERT_POOL_LAYER_END=${REMOTE_EXPERT_POOL_LAYER_END:-42}
+# Expert offload 命中率模拟日志：不改变推理，只在 A3 offload 每次 CPU-gather 后统计
+# 「如果有一个 LRU 专家池」的命中率/省下的拷贝量，并打印每层单专家 slot 内存。
+# coordinator 跑的层多，1GiB 连 34 层单 token 活跃集都放不下；默认给本机模拟池 4GiB。
+# 这是 profiler 的模拟 cache，不实际分配这些 expert 常驻内存；真实 expert pool 后续再按预算实现。
+# EXPERT_PROFILE_ALL=1 会在进程正常退出时打印所有出现过的专家；默认只打印每层 top-N。
+EXPERT_PROFILE=${EXPERT_PROFILE:-1}
+LOCAL_EXPERT_PROFILE_CACHE_MB=${LOCAL_EXPERT_PROFILE_CACHE_MB:-4096}
+REMOTE_EXPERT_PROFILE_CACHE_MB=${REMOTE_EXPERT_PROFILE_CACHE_MB:-1024}
+# 兼容旧变量：如果只设置 EXPERT_PROFILE_CACHE_MB，则两边都用这个值。
+if [ -n "${EXPERT_PROFILE_CACHE_MB:-}" ]; then
+  LOCAL_EXPERT_PROFILE_CACHE_MB=$EXPERT_PROFILE_CACHE_MB
+  REMOTE_EXPERT_PROFILE_CACHE_MB=$EXPERT_PROFILE_CACHE_MB
+fi
+EXPERT_PROFILE_TOP=${EXPERT_PROFILE_TOP:-8}
+EXPERT_PROFILE_INTERVAL=${EXPERT_PROFILE_INTERVAL:-64}
+EXPERT_PROFILE_ALL=${EXPERT_PROFILE_ALL:-0}
+LOCAL_PROFILE_ENV=""
+REMOTE_PROFILE_ENV=""
+if [ "$EXPERT_PROFILE" = 1 ]; then
+  LOCAL_PROFILE_ENV="DS4_METAL_EXPERT_OFFLOAD_PROFILE=1 DS4_METAL_EXPERT_PROFILE_CACHE_MB=$LOCAL_EXPERT_PROFILE_CACHE_MB DS4_METAL_EXPERT_PROFILE_TOP=$EXPERT_PROFILE_TOP DS4_METAL_EXPERT_PROFILE_INTERVAL=$EXPERT_PROFILE_INTERVAL"
+  REMOTE_PROFILE_ENV="DS4_METAL_EXPERT_OFFLOAD_PROFILE=1 DS4_METAL_EXPERT_PROFILE_CACHE_MB=$REMOTE_EXPERT_PROFILE_CACHE_MB DS4_METAL_EXPERT_PROFILE_TOP=$EXPERT_PROFILE_TOP DS4_METAL_EXPERT_PROFILE_INTERVAL=$EXPERT_PROFILE_INTERVAL"
+  [ "$EXPERT_PROFILE_ALL" = 1 ] && LOCAL_PROFILE_ENV="$LOCAL_PROFILE_ENV DS4_METAL_EXPERT_PROFILE_ALL=1"
+  [ "$EXPERT_PROFILE_ALL" = 1 ] && REMOTE_PROFILE_ENV="$REMOTE_PROFILE_ENV DS4_METAL_EXPERT_PROFILE_ALL=1"
+fi
+[ "$LOCAL_EXPERT_POOL_MB" != 0 ] && LOCAL_PROFILE_ENV="$LOCAL_PROFILE_ENV DS4_METAL_EXPERT_POOL_MB=$LOCAL_EXPERT_POOL_MB DS4_METAL_EXPERT_POOL_INTERVAL=$EXPERT_PROFILE_INTERVAL DS4_METAL_EXPERT_POOL_LAYER_START=$LOCAL_EXPERT_POOL_LAYER_START DS4_METAL_EXPERT_POOL_LAYER_END=$LOCAL_EXPERT_POOL_LAYER_END"
+[ "$REMOTE_EXPERT_POOL_MB" != 0 ] && REMOTE_PROFILE_ENV="$REMOTE_PROFILE_ENV DS4_METAL_EXPERT_POOL_MB=$REMOTE_EXPERT_POOL_MB DS4_METAL_EXPERT_POOL_INTERVAL=$EXPERT_PROFILE_INTERVAL DS4_METAL_EXPERT_POOL_LAYER_START=$REMOTE_EXPERT_POOL_LAYER_START DS4_METAL_EXPERT_POOL_LAYER_END=$REMOTE_EXPERT_POOL_LAYER_END"
+[ "$LOCAL_EXPERT_SOURCE_CACHE_MB" != 0 ] && LOCAL_PROFILE_ENV="$LOCAL_PROFILE_ENV DS4_METAL_EXPERT_SOURCE_CACHE_MB=$LOCAL_EXPERT_SOURCE_CACHE_MB DS4_METAL_EXPERT_SOURCE_CACHE_LAYER_START=$LOCAL_EXPERT_SOURCE_CACHE_LAYER_START DS4_METAL_EXPERT_SOURCE_CACHE_LAYER_END=$LOCAL_EXPERT_SOURCE_CACHE_LAYER_END DS4_METAL_EXPERT_SOURCE_CACHE_ADMIT_AFTER=$EXPERT_SOURCE_CACHE_ADMIT_AFTER DS4_METAL_EXPERT_SOURCE_CACHE_INTERVAL=$EXPERT_PROFILE_INTERVAL DS4_METAL_EXPERT_SOURCE_CACHE_MLOCK=$EXPERT_SOURCE_CACHE_MLOCK"
+[ "$REMOTE_EXPERT_SOURCE_CACHE_MB" != 0 ] && REMOTE_PROFILE_ENV="$REMOTE_PROFILE_ENV DS4_METAL_EXPERT_SOURCE_CACHE_MB=$REMOTE_EXPERT_SOURCE_CACHE_MB DS4_METAL_EXPERT_SOURCE_CACHE_LAYER_START=$REMOTE_EXPERT_SOURCE_CACHE_LAYER_START DS4_METAL_EXPERT_SOURCE_CACHE_LAYER_END=$REMOTE_EXPERT_SOURCE_CACHE_LAYER_END DS4_METAL_EXPERT_SOURCE_CACHE_ADMIT_AFTER=$EXPERT_SOURCE_CACHE_ADMIT_AFTER DS4_METAL_EXPERT_SOURCE_CACHE_INTERVAL=$EXPERT_PROFILE_INTERVAL DS4_METAL_EXPERT_SOURCE_CACHE_MLOCK=$EXPERT_SOURCE_CACHE_MLOCK"
 # reverse-connect 是本拓扑的核心 (见顶部注释)。两机都要带。
 # DS4_METAL_PREFILL_CHUNK 限制 prefill scratch, 防 M1 worker GPU 命令缓冲 OOM (见上)。
 # DS4_METAL_EXPERT_OFFLOAD 让 q2 routed experts 走 A3 按需 scratch; NO_MODEL_WARMUP 避免启动时扫冷 expert views。
-RUN_ENV=${RUN_ENV:-"DS4_DIST_REVERSE_CONNECT=1 DS4_METAL_PREFILL_CHUNK=$PREFILL_CHUNK DS4_METAL_EXPERT_OFFLOAD=1 DS4_METAL_NO_MODEL_WARMUP=1"}
+BASE_RUN_ENV=${BASE_RUN_ENV:-"DS4_DIST_REVERSE_CONNECT=1 DS4_METAL_PREFILL_CHUNK=$PREFILL_CHUNK DS4_METAL_EXPERT_OFFLOAD=1 DS4_METAL_NO_MODEL_WARMUP=1"}
+# RUN_ENV 仍可一把覆盖两边；LOCAL_RUN_ENV/REMOTE_RUN_ENV 可分别覆盖。
+LOCAL_RUN_ENV=${LOCAL_RUN_ENV:-${RUN_ENV:-"$BASE_RUN_ENV $LOCAL_PROFILE_ENV"}}
+REMOTE_RUN_ENV=${REMOTE_RUN_ENV:-${RUN_ENV:-"$BASE_RUN_ENV $REMOTE_PROFILE_ENV"}}
 
-COORD_LOG=/tmp/mtp_pipe_coord.log              # 本机 M4 路径 (coordinator)
+COORD_LOG=/tmp/mtp_pipe_coord.log              # 本机 M4 路径 (coordinator stderr: ds4 日志/速度/profile)
+COORD_OUT=/tmp/mtp_pipe_coord.out              # 本机 M4 路径 (coordinator stdout: 纯生成文本)
 WORKER_LOG=/tmp/mtp_pipe_worker.log            # M1 上的路径 (worker)
 WORKER_PID_FILE=/tmp/mtp_pipe_worker.pid        # M1 上本脚本启动的 worker pid
 COORD_PID=""
@@ -123,7 +175,7 @@ sleep 1
 # ---------------- 4. 先起 M1 worker (control listen, 等 coordinator 来拨) ----------------
 log "启动 M1 worker: --listen $WORKER_IP:$PORT --layers $SPLIT_WORKER ${WORKER_MTP_ARGS:-(无 MTP)} (reverse, 只 accept)"
 ssh "$REMOTE" "cd '$REMOTE_DIR' && rm -f '$WORKER_LOG'; \
-  $RUN_ENV DS4_MEM_BUDGET_MB=$REMOTE_BUDGET_MB \
+  $REMOTE_RUN_ENV DS4_MEM_BUDGET_MB=$REMOTE_BUDGET_MB \
   nohup ./ds4 -m '$MODEL' --role worker --listen '$WORKER_IP' '$PORT' \
   --layers '$SPLIT_WORKER' $WORKER_MTP_ARGS \
   -c '$CTX' --temp 0 --nothink > '$WORKER_LOG' 2>&1 & echo \$! > '$WORKER_PID_FILE'; echo launched" 2>/dev/null
@@ -143,14 +195,17 @@ sleep 1
 
 # ---------------- 5. 起本机 coordinator (主动拨 M1 worker, 跑一次性生成) ----------------
 log "启动本机 coordinator: --coordinator $WORKER_IP:$PORT --layers $SPLIT_COORD ${COORD_MTP_ARGS:-(无 MTP)} (reverse, 主动拨)"
+[ "$EXPERT_PROFILE" = 1 ] && log "专家命中率模拟 cache: coordinator=${LOCAL_EXPERT_PROFILE_CACHE_MB}MiB worker=${REMOTE_EXPERT_PROFILE_CACHE_MB}MiB (仅模拟)"
+log "真实 expert pool: coordinator=${LOCAL_EXPERT_POOL_MB}MiB layers=${LOCAL_EXPERT_POOL_LAYER_START}:${LOCAL_EXPERT_POOL_LAYER_END} worker=${REMOTE_EXPERT_POOL_MB}MiB layers=${REMOTE_EXPERT_POOL_LAYER_START}:${REMOTE_EXPERT_POOL_LAYER_END} (实际分配, 默认关闭)"
+log "源页保活 cache: coordinator=${LOCAL_EXPERT_SOURCE_CACHE_MB}MiB layers=${LOCAL_EXPERT_SOURCE_CACHE_LAYER_START}:${LOCAL_EXPERT_SOURCE_CACHE_LAYER_END} worker=${REMOTE_EXPERT_SOURCE_CACHE_MB}MiB layers=${REMOTE_EXPERT_SOURCE_CACHE_LAYER_START}:${REMOTE_EXPERT_SOURCE_CACHE_LAYER_END} admit_after=$EXPERT_SOURCE_CACHE_ADMIT_AFTER mlock=$EXPERT_SOURCE_CACHE_MLOCK"
 log "  (首次可能弹 macOS 本地网络授权框 → 点允许)"
 cd "$LOCAL_DIR"
-rm -f "$COORD_LOG"
-env $RUN_ENV DS4_MEM_BUDGET_MB=$LOCAL_BUDGET_MB \
+rm -f "$COORD_LOG" "$COORD_OUT"
+env $LOCAL_RUN_ENV DS4_MEM_BUDGET_MB=$LOCAL_BUDGET_MB \
   ./ds4 -m "$MODEL" --role coordinator --coordinator "$WORKER_IP" "$PORT" \
   --layers "$SPLIT_COORD" $COORD_MTP_ARGS \
   -c "$CTX" -n "$NPRED" --temp 0 --seed "$SEED" --nothink \
-  -p "$PROMPT" > "$COORD_LOG" 2>&1 &
+  -p "$PROMPT" > "$COORD_OUT" 2> "$COORD_LOG" &
 COORD_PID=$!
 
 # ---------------- 6. 看门狗: 等本机 coordinator 一次性生成结束 ----------------
@@ -169,18 +224,26 @@ echo
 # ---------------- 7. 结果 (在本机 coordinator 日志) ----------------
 # 注: 生成文本可能含大量换行 token (尤其退化的 reduced-expert 模型), 末尾常是成片空行。
 # 必须先滤掉纯空白行再 tail, 否则 tail 全抓到尾部空行 → 看着像"没输出文本"(其实内容在前面)。
-log "本机 coordinator 生成文本 (已滤 ds4 日志行与纯空白行):"
-gen_lines=$(grep -v -E '^ds4:|^ds4_profile' "$COORD_LOG" | grep -v -E '^[[:space:]]*$')
+log "本机 coordinator 生成文本 (stdout, 已滤纯空白行):"
+gen_lines=$(grep -v -E '^[[:space:]]*$' "$COORD_OUT" 2>/dev/null || true)
 if [ -n "$gen_lines" ]; then
-  printf '%s\n' "$gen_lines" | tail -20
+  printf '%s\n' "$gen_lines" | tail -40
 else
-  log "(无非空文本行: 本次生成可能全是换行/空白 token —— k4/k16 等退化模型常见)"
+  log "(stdout 无非空文本行: 本次生成可能全是换行/空白 token；或 coordinator 未完成输出 flush)"
 fi
 echo "----------------------------------------"
 if grep -qiE 'prefill:|generation:|t/s' "$COORD_LOG" 2>/dev/null; then
   log "速度 (本机 coordinator):"; grep -iE 'prefill:|generation:|t/s' "$COORD_LOG" | tail -2
 else
   log "未拿到计时行, 本机 coordinator 日志尾:"; tail -12 "$COORD_LOG"
+fi
+if [ "$EXPERT_PROFILE" = 1 ]; then
+  echo "----------------------------------------"
+  log "专家 offload 命中率摘要 (本机 coordinator):"
+  grep -iE 'expert-(profile|pool|source-cache) (summary|live|layer|  L|memory|enabled|enabled via)' "$COORD_LOG" | tail -100 || true
+  echo "----------------------------------------"
+  log "专家 offload 命中率摘要 (M1 worker):"
+  ssh "$REMOTE" "grep -iE 'expert-(profile|pool|source-cache) (summary|live|layer|  L|memory|enabled|enabled via)' '$WORKER_LOG' | tail -100" 2>/dev/null || true
 fi
 [ "$done_flag" = 1 ] || log "(注: coordinator 未正常结束, 上面是当前日志快照)"
 cleanup
